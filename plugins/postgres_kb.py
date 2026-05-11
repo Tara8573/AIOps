@@ -33,9 +33,15 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         )
         self.vector_dim = vector_dim
         self.top_k = top_k
-        self.embedding_provider = os.getenv("AIOPS_EMBEDDING_PROVIDER", "local").strip().lower()
-        self.embedding_api_url = self._get_service_url("AIOPS_EMBEDDING_API_URL", "/embeddings")
-        self.embedding_api_key = self._get_env("AIOPS_EMBEDDING_API_KEY", "AIOPS_REMOTE_API_KEY").strip()
+        self.embedding_provider = (
+            os.getenv("AIOPS_EMBEDDING_PROVIDER", "local").strip().lower()
+        )
+        self.embedding_api_url = self._get_service_url(
+            "AIOPS_EMBEDDING_API_URL", "/embeddings"
+        )
+        self.embedding_api_key = self._get_env(
+            "AIOPS_EMBEDDING_API_KEY", "AIOPS_REMOTE_API_KEY"
+        ).strip()
         self.embedding_api_key_header = self._get_env(
             "AIOPS_EMBEDDING_API_KEY_HEADER",
             "AIOPS_REMOTE_API_KEY_HEADER",
@@ -47,9 +53,15 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             default="Bearer",
         ).strip()
         self.embedding_model = os.getenv("AIOPS_EMBEDDING_MODEL", "").strip()
-        self.embedding_input_field = os.getenv("AIOPS_EMBEDDING_INPUT_FIELD", "input").strip()
-        self.embedding_model_field = os.getenv("AIOPS_EMBEDDING_MODEL_FIELD", "model").strip()
-        self.embedding_vector_path = os.getenv("AIOPS_EMBEDDING_VECTOR_PATH", "data.0.embedding").strip()
+        self.embedding_input_field = os.getenv(
+            "AIOPS_EMBEDDING_INPUT_FIELD", "input"
+        ).strip()
+        self.embedding_model_field = os.getenv(
+            "AIOPS_EMBEDDING_MODEL_FIELD", "model"
+        ).strip()
+        self.embedding_vector_path = os.getenv(
+            "AIOPS_EMBEDDING_VECTOR_PATH", "data.0.embedding"
+        ).strip()
         self.embedding_timeout_seconds = float(
             self._get_env(
                 "AIOPS_EMBEDDING_TIMEOUT_SECONDS",
@@ -57,10 +69,14 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                 default="20",
             )
         )
-        self.embedding_fallback_local = os.getenv("AIOPS_EMBEDDING_FALLBACK_LOCAL", "1") == "1"
+        self.embedding_fallback_local = (
+            os.getenv("AIOPS_EMBEDDING_FALLBACK_LOCAL", "1") == "1"
+        )
         self.rerank_enabled = os.getenv("AIOPS_RERANK_ENABLED", "0") == "1"
         self.rerank_api_url = self._get_service_url("AIOPS_RERANK_API_URL", "/rerank")
-        self.rerank_api_key = self._get_env("AIOPS_RERANK_API_KEY", "AIOPS_REMOTE_API_KEY").strip()
+        self.rerank_api_key = self._get_env(
+            "AIOPS_RERANK_API_KEY", "AIOPS_REMOTE_API_KEY"
+        ).strip()
         self.rerank_api_key_header = self._get_env(
             "AIOPS_RERANK_API_KEY_HEADER",
             "AIOPS_REMOTE_API_KEY_HEADER",
@@ -73,10 +89,16 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         ).strip()
         self.rerank_model = os.getenv("AIOPS_RERANK_MODEL", "").strip()
         self.rerank_query_field = os.getenv("AIOPS_RERANK_QUERY_FIELD", "query").strip()
-        self.rerank_docs_field = os.getenv("AIOPS_RERANK_DOCS_FIELD", "documents").strip()
+        self.rerank_docs_field = os.getenv(
+            "AIOPS_RERANK_DOCS_FIELD", "documents"
+        ).strip()
         self.rerank_model_field = os.getenv("AIOPS_RERANK_MODEL_FIELD", "model").strip()
-        self.rerank_scores_path = os.getenv("AIOPS_RERANK_SCORES_PATH", "results").strip()
-        self.rerank_score_field = os.getenv("AIOPS_RERANK_SCORE_FIELD", "relevance_score").strip()
+        self.rerank_scores_path = os.getenv(
+            "AIOPS_RERANK_SCORES_PATH", "results"
+        ).strip()
+        self.rerank_score_field = os.getenv(
+            "AIOPS_RERANK_SCORE_FIELD", "relevance_score"
+        ).strip()
         self.rerank_index_field = os.getenv("AIOPS_RERANK_INDEX_FIELD", "index").strip()
         self.rerank_timeout_seconds = float(
             self._get_env(
@@ -85,10 +107,18 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                 default="20",
             )
         )
-        self.rerank_candidate_k = int(os.getenv("AIOPS_RERANK_CANDIDATE_K", str(max(10, top_k * 3))))
-        self.rerank_fallback_vector = os.getenv("AIOPS_RERANK_FALLBACK_VECTOR", "1") == "1"
-        self.approx_dedupe_enabled = os.getenv("AIOPS_KB_APPROX_DEDUPE_ENABLED", "1") == "1"
-        self.approx_dedupe_candidate_k = int(os.getenv("AIOPS_KB_APPROX_DEDUPE_CANDIDATE_K", "5"))
+        self.rerank_candidate_k = int(
+            os.getenv("AIOPS_RERANK_CANDIDATE_K", str(max(10, top_k * 3)))
+        )
+        self.rerank_fallback_vector = (
+            os.getenv("AIOPS_RERANK_FALLBACK_VECTOR", "1") == "1"
+        )
+        self.approx_dedupe_enabled = (
+            os.getenv("AIOPS_KB_APPROX_DEDUPE_ENABLED", "1") == "1"
+        )
+        self.approx_dedupe_candidate_k = int(
+            os.getenv("AIOPS_KB_APPROX_DEDUPE_CANDIDATE_K", "5")
+        )
         self.approx_dedupe_distance_threshold = float(
             os.getenv("AIOPS_KB_APPROX_DEDUPE_DISTANCE_THRESHOLD", "0.08")
         )
@@ -101,13 +131,25 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         self._ensure_schema()
 
     @staticmethod
-    def _get_env(primary: str, fallback: Optional[str] = None, default: str = "") -> str:
+    def _get_env(
+        primary: str, fallback: Optional[str] = None, default: str = ""
+    ) -> str:
         value = os.getenv(primary)
         if value is not None and value.strip():
+            # 如果值是另一个环境变量名（如 DEEPSEEK_API_KEY），尝试读取它
+            if value.isupper() and "_" in value:
+                env_value = os.getenv(value)
+                if env_value is not None and env_value.strip():
+                    return env_value
             return value
         if fallback:
             fallback_value = os.getenv(fallback)
             if fallback_value is not None and fallback_value.strip():
+                # 同样检查 fallback 值是否是环境变量名
+                if fallback_value.isupper() and "_" in fallback_value:
+                    env_value = os.getenv(fallback_value)
+                    if env_value is not None and env_value.strip():
+                        return env_value
                 return fallback_value
         return default
 
@@ -191,14 +233,18 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         return " ".join(text.strip().lower().split())
 
     def _build_dedupe_key(self, alert_feature: str, content: str) -> str:
-        normalized = f"{self._normalize_text(alert_feature)}|{self._normalize_text(content)}"
+        normalized = (
+            f"{self._normalize_text(alert_feature)}|{self._normalize_text(content)}"
+        )
         return hashlib.md5(normalized.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _compose_feedback_feature(feedback: Feedback) -> str:
         return feedback.actual_root_cause.strip()
 
-    def _build_experience_content(self, actual_root_cause: str, resolution_steps: str) -> str:
+    def _build_experience_content(
+        self, actual_root_cause: str, resolution_steps: str
+    ) -> str:
         return f"人工处置经验: root_cause={actual_root_cause}; resolution_steps={resolution_steps}"
 
     @staticmethod
@@ -223,7 +269,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             return set()
         if len(normalized) <= size:
             return {normalized}
-        return {normalized[idx : idx + size] for idx in range(len(normalized) - size + 1)}
+        return {
+            normalized[idx : idx + size] for idx in range(len(normalized) - size + 1)
+        }
 
     def _char_similarity(self, left: str, right: str) -> float:
         left_ngrams = self._char_ngrams(left)
@@ -280,7 +328,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             existing_text = f"{row[2]}\n{row[3]}"
             overlap_ratio = self._text_overlap_ratio(incoming_text, existing_text)
             char_similarity = self._char_similarity(incoming_text, existing_text)
-            sequence_similarity = self._sequence_similarity(incoming_text, existing_text)
+            sequence_similarity = self._sequence_similarity(
+                incoming_text, existing_text
+            )
             distance = float(row[6])
             if (
                 (
@@ -332,7 +382,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (source, alert_feature, content, dedupe_key, Vector(embedding)))
+                cur.execute(
+                    sql, (source, alert_feature, content, dedupe_key, Vector(embedding))
+                )
                 return cur.rowcount > 0
 
     def _embed_text_local(self, text: str) -> List[float]:
@@ -364,7 +416,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             elif isinstance(cur, dict):
                 cur = cur[seg]
             else:
-                raise ValueError(f"invalid path segment '{seg}' for value type {type(cur)}")
+                raise ValueError(
+                    f"invalid path segment '{seg}' for value type {type(cur)}"
+                )
         return cur
 
     def _embed_text_custom_api(self, text: str) -> List[float]:
@@ -377,7 +431,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         headers = {"Content-Type": "application/json"}
         if self.embedding_api_key:
             if self.embedding_api_key_prefix:
-                headers[self.embedding_api_key_header] = f"{self.embedding_api_key_prefix} {self.embedding_api_key}"
+                headers[self.embedding_api_key_header] = (
+                    f"{self.embedding_api_key_prefix} {self.embedding_api_key}"
+                )
             else:
                 headers[self.embedding_api_key_header] = self.embedding_api_key
 
@@ -387,7 +443,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self.embedding_timeout_seconds) as resp:
+        with urllib.request.urlopen(
+            req, timeout=self.embedding_timeout_seconds
+        ) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
 
@@ -407,10 +465,18 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         if self.embedding_provider == "custom_api":
             try:
                 return self._embed_text_custom_api(text)
-            except (urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ValueError,
+                KeyError,
+                IndexError,
+            ) as exc:
                 if not self.embedding_fallback_local:
                     raise
-                print(f"[PostgresKB] custom_api embedding failed, fallback local: {exc}")
+                print(
+                    f"[PostgresKB] custom_api embedding failed, fallback local: {exc}"
+                )
                 return self._embed_text_local(text)
         raise ValueError(
             "unsupported AIOPS_EMBEDDING_PROVIDER. supported: local, custom_api"
@@ -429,7 +495,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         headers = {"Content-Type": "application/json"}
         if self.rerank_api_key:
             if self.rerank_api_key_prefix:
-                headers[self.rerank_api_key_header] = f"{self.rerank_api_key_prefix} {self.rerank_api_key}"
+                headers[self.rerank_api_key_header] = (
+                    f"{self.rerank_api_key_prefix} {self.rerank_api_key}"
+                )
             else:
                 headers[self.rerank_api_key_header] = self.rerank_api_key
 
@@ -483,8 +551,16 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             try:
                 reranked = self._rerank_docs_custom_api(alert_feature, experiences)
                 experiences = reranked[: self.top_k]
-                print(f"[PostgresKB] rerank 生效: candidate={candidate_k}, top_k={self.top_k}")
-            except (urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError) as exc:
+                print(
+                    f"[PostgresKB] rerank 生效: candidate={candidate_k}, top_k={self.top_k}"
+                )
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ValueError,
+                KeyError,
+                IndexError,
+            ) as exc:
                 if not self.rerank_fallback_vector:
                     raise
                 experiences = experiences[: self.top_k]
@@ -507,5 +583,7 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             print(f"[PostgresKB] 跳过重复经验: alert={feedback.alert_id}")
         return inserted
 
-    def seed_experience(self, alert_feature: str, content: str, source: str = "seed") -> None:
+    def seed_experience(
+        self, alert_feature: str, content: str, source: str = "seed"
+    ) -> None:
         self._insert_experience(source, alert_feature, content)
