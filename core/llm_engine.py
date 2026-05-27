@@ -1,6 +1,10 @@
 import json
+import os
 from typing import List, Optional
+
+from core.cache import TTLCache, stable_cache_key
 from core.models import Alert, ActionPlan, LLMProposal, SkillExecutionResult
+from core.observability import metrics
 from interfaces.base import ILLMClient
 
 
@@ -9,6 +13,10 @@ class CognitiveEngine:
 
     def __init__(self, llm_client: ILLMClient):
         self.llm_client = llm_client
+        self._proposal_cache = TTLCache(
+            ttl_seconds=int(os.getenv("AIOPS_LLM_CACHE_TTL_SECONDS", "300")),
+            max_size=int(os.getenv("AIOPS_LLM_CACHE_MAX_SIZE", "256")),
+        )
 
     def analyze_alert(
         self,
@@ -17,6 +25,19 @@ class CognitiveEngine:
         skill_results: Optional[List[SkillExecutionResult]] = None,
     ) -> LLMProposal:
         """接收告警和历史经验，提示 LLM 生成排查动作"""
+        cache_key = stable_cache_key(
+            alert.title,
+            alert.level,
+            alert.content,
+            history_sops,
+            [result.model_dump() for result in (skill_results or [])],
+        )
+        cached_plan = self._proposal_cache.get(cache_key)
+        if cached_plan is not None:
+            metrics.incr("llm.cache.hit")
+            return LLMProposal(alert_id=alert.alert_id, plan=ActionPlan(**cached_plan))
+
+        metrics.incr("llm.cache.miss")
         sops_str = "\n".join(history_sops) if history_sops else "无历史参考"
         skill_results = skill_results or []
         skill_context = self._format_skill_context(skill_results)
@@ -51,9 +72,11 @@ class CognitiveEngine:
 
             data = json.loads(cleaned_text.strip())
             action_plan = ActionPlan(**data)
+            self._proposal_cache.set(cache_key, action_plan.model_dump())
             return LLMProposal(alert_id=alert.alert_id, plan=action_plan)
         except Exception as e:
             # 兜底：如果 LLM 没有正确返回结构化数据
+            metrics.incr("llm.parse.failure")
             fallback_plan = ActionPlan(
                 root_cause_analysis=f"解析LLM响应失败。Exception: {str(e)}\nRaw Response: {response_text[:100]}",
                 script_content=None,

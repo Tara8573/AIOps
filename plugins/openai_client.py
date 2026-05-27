@@ -2,6 +2,7 @@ import os
 import json
 import httpx
 from typing import Optional
+from core.observability import metrics
 from interfaces.base import ILLMClient
 
 
@@ -31,6 +32,12 @@ class OpenAILLMClient(ILLMClient):
                 "OpenAI API Key 未配置，请设置 OPENAI_API_KEY 环境变量或传入 api_key 参数"
             )
 
+        self._limits = httpx.Limits(
+            max_connections=int(os.getenv("AIOPS_HTTP_MAX_CONNECTIONS", "20")),
+            max_keepalive_connections=int(
+                os.getenv("AIOPS_HTTP_MAX_KEEPALIVE_CONNECTIONS", "10")
+            ),
+        )
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={
@@ -38,11 +45,13 @@ class OpenAILLMClient(ILLMClient):
                 "Content-Type": "application/json",
             },
             timeout=self.timeout,
+            limits=self._limits,
         )
 
     def generate_proposal(self, prompt: str) -> str:
         """调用 OpenAI Chat Completions API 生成提案"""
         try:
+            metrics.incr("llm.provider.openai.request")
             response = self._client.post(
                 "/chat/completions",
                 json={
@@ -63,15 +72,19 @@ class OpenAILLMClient(ILLMClient):
 
             result = response.json()
             content = result["choices"][0]["message"]["content"]
+            metrics.incr("llm.provider.openai.success")
             return content
 
         except httpx.HTTPStatusError as e:
+            metrics.incr("llm.provider.openai.http_error")
             raise RuntimeError(
                 f"OpenAI API 请求失败: {e.response.status_code} - {e.response.text}"
             )
         except httpx.RequestError as e:
+            metrics.incr("llm.provider.openai.network_error")
             raise RuntimeError(f"OpenAI API 网络错误: {str(e)}")
         except Exception as e:
+            metrics.incr("llm.provider.openai.exception")
             raise RuntimeError(f"OpenAI API 调用异常: {str(e)}")
 
     def close(self):
@@ -96,11 +109,21 @@ class OllamaLLMClient(ILLMClient):
         self.temperature = temperature
         self.timeout = timeout
 
-        self._client = httpx.Client(base_url=self.base_url, timeout=self.timeout)
+        self._client = httpx.Client(
+            base_url=self.base_url,
+            timeout=self.timeout,
+            limits=httpx.Limits(
+                max_connections=int(os.getenv("AIOPS_HTTP_MAX_CONNECTIONS", "20")),
+                max_keepalive_connections=int(
+                    os.getenv("AIOPS_HTTP_MAX_KEEPALIVE_CONNECTIONS", "10")
+                ),
+            ),
+        )
 
     def generate_proposal(self, prompt: str) -> str:
         """调用 Ollama API 生成提案"""
         try:
+            metrics.incr("llm.provider.ollama.request")
             response = self._client.post(
                 "/api/generate",
                 json={
@@ -113,15 +136,19 @@ class OllamaLLMClient(ILLMClient):
             response.raise_for_status()
 
             result = response.json()
+            metrics.incr("llm.provider.ollama.success")
             return result.get("response", "")
 
         except httpx.HTTPStatusError as e:
+            metrics.incr("llm.provider.ollama.http_error")
             raise RuntimeError(
                 f"Ollama API 请求失败: {e.response.status_code} - {e.response.text}"
             )
         except httpx.RequestError as e:
+            metrics.incr("llm.provider.ollama.network_error")
             raise RuntimeError(f"Ollama API 网络错误: {str(e)}")
         except Exception as e:
+            metrics.incr("llm.provider.ollama.exception")
             raise RuntimeError(f"Ollama API 调用异常: {str(e)}")
 
     def close(self):

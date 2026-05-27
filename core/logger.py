@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
 from loguru import logger
+from core.observability import metrics, pipeline_states
 
 
 class LogConfig:
@@ -83,6 +84,17 @@ class LogConfig:
                 str(log_path / "error_{time:YYYY-MM-DD}.log"),
                 format=log_format,
                 level="ERROR",
+                rotation=rotation,
+                retention=retention,
+                compression=compression,
+                encoding="utf-8",
+            )
+
+            logger.add(
+                str(log_path / "audit_{time:YYYY-MM-DD}.log"),
+                format=log_format,
+                level="INFO",
+                filter=lambda record: record["extra"].get("audit_event", False),
                 rotation=rotation,
                 retention=retention,
                 compression=compression,
@@ -206,6 +218,22 @@ class AIOpsLogger:
             operation=operation,
             duration_ms=duration_ms,
             success=success,
+        )
+
+    def audit_event(self, event_type: str, payload: Dict[str, Any]):
+        """审计事件日志"""
+        self.logger.bind(audit_event=True).info(
+            "审计事件 | type={event_type} | payload={payload}",
+            event_type=event_type,
+            payload=payload,
+        )
+
+    def health_snapshot(self):
+        """输出轻量健康快照"""
+        self.logger.info(
+            "健康快照 | metrics={metrics} | states={states_count}",
+            metrics=metrics.snapshot(),
+            states_count=len(pipeline_states.snapshot()),
         )
 
 

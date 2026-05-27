@@ -14,7 +14,9 @@ import psycopg
 from pgvector import Vector
 from pgvector.psycopg import register_vector
 
+from core.cache import TTLCache, stable_cache_key
 from core.models import Feedback
+from core.observability import metrics
 from interfaces.base import IKnowledgeBase
 
 
@@ -127,6 +129,10 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         )
         self.approx_dedupe_text_similarity_threshold = float(
             os.getenv("AIOPS_KB_APPROX_DEDUPE_TEXT_SIMILARITY_THRESHOLD", "0.72")
+        )
+        self.search_cache = TTLCache(
+            ttl_seconds=int(os.getenv("AIOPS_KB_SEARCH_CACHE_TTL_SECONDS", "300")),
+            max_size=int(os.getenv("AIOPS_KB_SEARCH_CACHE_MAX_SIZE", "256")),
         )
         self._ensure_schema()
 
@@ -531,6 +537,19 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         return ordered
 
     def search_experience(self, alert_feature: str) -> List[str]:
+        cache_key = stable_cache_key(
+            "kb_search",
+            alert_feature,
+            self.top_k,
+            self.rerank_enabled,
+            self.rerank_candidate_k,
+        )
+        cached = self.search_cache.get(cache_key)
+        if cached is not None:
+            metrics.incr("kb.search.cache.hit")
+            return list(cached)
+
+        metrics.incr("kb.search.cache.miss")
         embedding = self._embed_text(alert_feature)
         sql = """
             SELECT content
@@ -568,6 +587,8 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         else:
             experiences = experiences[: self.top_k]
         print(f"[PostgresKB] 检索经验 {len(experiences)} 条: {alert_feature}")
+        self.search_cache.set(cache_key, list(experiences))
+        metrics.gauge("kb.search.cache.size", self.search_cache.stats()["size"])
         return experiences
 
     def learn_new_experience(self, feedback: Feedback) -> bool:

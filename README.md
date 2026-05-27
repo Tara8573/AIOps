@@ -20,9 +20,38 @@
 ## 核心目录结构
 - `core/`: 核心领域数据模型，LLM交互引擎与自审查评估器。
 - `interfaces/`: 防腐层/接口顶层抽象定义。
-- `plugins/`: 应对外界不同环境的具体调用实现或 Mock 类。
+- `plugins/`: 应对外界不同环境的具体调用实现或 Mock 类，也可承载 skill 实现。
+- `core/skills.py`: skill 注册与调度中心。
 - `pipeline.py`: 主体工作链条调度。
 - `main.py`: 框架全链路模拟与单元实战入口。
+
+## Skills 接入方式
+项目现已支持在告警主流程中接入 `skills`，但设计上仍与现有 `plugins` 架构兼容：
+
+1. 在 `interfaces/base.py` 中实现 `ISkill`
+2. 在 `plugins/skills.py` 或独立模块中编写具体 skill
+3. 在 `main.py` 中注册到 `SkillRegistry`
+4. `pipeline.py` 会先执行匹配到的 skills，再把结果一并交给 LLM 分析
+
+示例：
+
+```python
+from core.skills import SkillRegistry
+from plugins.skills import DiskCleanupSkill
+
+skill_registry = SkillRegistry([DiskCleanupSkill()])
+
+pipeline = AIOpsPipeline(
+    kb=kb,
+    llm=llm,
+    executor=executor,
+    approval_gate=approval_gate,
+    ticketing=ticketing,
+    skill_registry=skill_registry,
+)
+```
+
+`skill` 需要返回结构化结果，供 LLM 结合历史 SOP 一起决策，而不是直接替代原有评估与执行链路。
 
 ## PostgreSQL + pgvector 落地
 已提供 `PostgresVectorKnowledgeBase`，可替换默认 Mock 知识库。
@@ -151,3 +180,54 @@ AIOPS_KB_APPROX_DEDUPE_TEXT_SIMILARITY_THRESHOLD=0.72
 - `AIOPS_KB_APPROX_DEDUPE_DISTANCE_THRESHOLD`: 向量距离阈值，越小越严格。
 - `AIOPS_KB_APPROX_DEDUPE_OVERLAP_THRESHOLD`: 文本重合度阈值，越大越严格。
 - `AIOPS_KB_APPROX_DEDUPE_TEXT_SIMILARITY_THRESHOLD`: 字符级相似度阈值，适合兜底中文同义改写场景。
+
+## 框架优化开关
+当前版本已补充一批高优先级框架优化，默认可直接使用，也可通过环境变量调节：
+
+```bash
+AIOPS_LOG_LEVEL=INFO
+AIOPS_LOG_JSON=0
+AIOPS_LOG_DIR=./logs
+
+AIOPS_LLM_CACHE_TTL_SECONDS=300
+AIOPS_LLM_CACHE_MAX_SIZE=256
+
+AIOPS_KB_SEARCH_CACHE_TTL_SECONDS=300
+AIOPS_KB_SEARCH_CACHE_MAX_SIZE=256
+
+AIOPS_MIN_CONFIDENCE=0.7
+AIOPS_DANGEROUS_SCRIPT_PATTERNS=
+
+AIOPS_HTTP_MAX_CONNECTIONS=20
+AIOPS_HTTP_MAX_KEEPALIVE_CONNECTIONS=10
+
+AIOPS_BATCH_SIZE=1
+AIOPS_ROUTER_MANUAL_PATTERNS=
+AIOPS_ROUTER_FAST_TRACK_PATTERNS=
+```
+
+对应能力：
+
+- `LLM 响应缓存`：对相似告警分析结果做 TTL 复用，降低重复模型调用
+- `知识库检索缓存`：对相同检索请求做短期缓存，减少重复向量查询
+- `处理状态追踪`：记录告警在接收、检索、分析、评估、执行、提单等阶段的流转
+- `性能指标采集`：采集知识检索、LLM 分析、评估、执行、整单耗时等指标
+- `脚本安全扫描`：对高危修复命令做执行前拦截
+- `审计日志`：对关键决策事件额外输出 audit 日志
+- `批量处理`：消费侧支持缓冲多条告警后统一按优先级排序处理
+- `智能路由`：支持通过路由规则把高风险或特定类型告警直接导向人工处理链路
+
+### 批量处理与路由说明
+
+- `AIOPS_BATCH_SIZE`
+  - 每次从持续消费链路缓冲多少条告警后再统一处理
+  - 默认为 `1`，表示保持单条实时处理
+
+- `AIOPS_ROUTER_MANUAL_PATTERNS`
+  - 逗号分隔的正则列表
+  - 命中后直接走 `manual-first` 路由，优先提单，不进入 LLM 与自动执行链路
+  - 适合高风险、强人工依赖场景
+
+- `AIOPS_ROUTER_FAST_TRACK_PATTERNS`
+  - 逗号分隔的正则列表
+  - 当前用于打上快速处理标签并提升优先级，后续可继续扩展成独立快速通道

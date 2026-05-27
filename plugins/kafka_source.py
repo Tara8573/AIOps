@@ -64,7 +64,7 @@ class KafkaAlertSource(IAlertSource):
             config["sasl_password"] = self._sasl_password
 
         consumer = KafkaConsumer(self._topic, **config)
-        logger.logger.info(
+        logger.info(
             "Kafka 消费者已创建 | servers={} | topic={} | group={}",
             self._bootstrap_servers,
             self._topic,
@@ -79,13 +79,13 @@ class KafkaAlertSource(IAlertSource):
         try:
             return json.loads(raw_bytes.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            logger.logger.warning("消息反序列化失败 | error={}", exc)
+            logger.warning("消息反序列化失败 | error={}", exc)
             return None
 
     def consume(self) -> Generator[Dict[str, Any], None, None]:
         self._consumer = self._create_consumer()
         self._running = True
-        logger.logger.info("开始消费 Kafka 告警消息...")
+        logger.info("开始消费 Kafka 告警消息...")
 
         try:
             while self._running and not self._stop_event.is_set():
@@ -97,7 +97,7 @@ class KafkaAlertSource(IAlertSource):
                             continue
                         yield raw
         except KafkaError as exc:
-            logger.logger.error("Kafka 消费异常 | error={}", exc)
+            logger.error("Kafka 消费异常 | error={}", exc)
             raise
         finally:
             self.close()
@@ -108,7 +108,7 @@ class KafkaAlertSource(IAlertSource):
         if self._consumer is not None:
             try:
                 self._consumer.close()
-                logger.logger.info("Kafka 消费者已关闭")
+                logger.info("Kafka 消费者已关闭")
             except Exception as exc:
-                logger.logger.error("关闭 Kafka 消费者异常 | error={}", exc)
+                logger.error("关闭 Kafka 消费者异常 | error={}", exc)
             self._consumer = None

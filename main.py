@@ -4,6 +4,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from core.models import Alert
+from core.logger import LogConfig, get_logger
+from core.observability import metrics
 from core.processor import AlertCleaner, AlertFilter
 from core.skills import SkillRegistry
 from plugins.mocks import (
@@ -17,6 +19,12 @@ from plugins.skills import DiskCleanupSkill
 from pipeline import AIOpsPipeline
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+LogConfig.setup(
+    log_dir=os.getenv("AIOPS_LOG_DIR", "./logs"),
+    log_level=os.getenv("AIOPS_LOG_LEVEL", "INFO"),
+    json_format=os.getenv("AIOPS_LOG_JSON", "0") == "1",
+)
+app_logger = get_logger("main")
 
 
 def build_kb():
@@ -208,6 +216,8 @@ def demo():
     if ticket_id:
         print("\n>>> 【知识回流测试】 同步工单反馈并沉淀经验")
         pipeline.sync_feedbacks([ticket_id])
+    app_logger.health_snapshot()
+    print(f"[Metrics] {metrics.snapshot()}")
 
 
 def run_kafka():
@@ -248,6 +258,8 @@ def run_kafka():
     print("\n>>> 按 Ctrl+C 停止消费\n")
 
     pipeline.run_from_source()
+    app_logger.health_snapshot()
+    print(f"[Metrics] {metrics.snapshot()}")
 
 
 if __name__ == "__main__":
