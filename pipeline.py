@@ -1,6 +1,7 @@
 from core.models import Alert
 from core.llm_engine import CognitiveEngine
 from core.evaluator import SolutionEvaluator
+from core.intent import AlertIntentClassifier
 from core.logger import get_logger
 from core.observability import metrics, pipeline_states
 from core.routing import AlertRouteDecision, AlertRouter, sort_alerts_by_priority
@@ -15,7 +16,7 @@ from interfaces.base import (
     IAlertFilter,
 )
 from core.skills import SkillRegistry
-from typing import Optional, List
+from typing import Any, Optional, List
 import os
 import time
 
@@ -36,6 +37,7 @@ class AIOpsPipeline:
         alert_source: Optional[IAlertSource] = None,
         alert_cleaner: Optional[IAlertCleaner] = None,
         alert_filter: Optional[IAlertFilter] = None,
+        jira_knowledge_retriever: Optional[Any] = None,
     ):
         self.kb = kb
         self.engine = CognitiveEngine(llm)
@@ -47,7 +49,9 @@ class AIOpsPipeline:
         self.alert_source = alert_source
         self.alert_cleaner = alert_cleaner
         self.alert_filter = alert_filter
+        self.jira_knowledge_retriever = jira_knowledge_retriever
         self.router = AlertRouter()
+        self.intent_classifier = AlertIntentClassifier()
 
     def process_alert(
         self, alert: Alert, route_decision: Optional[AlertRouteDecision] = None
@@ -59,13 +63,16 @@ class AIOpsPipeline:
         pipeline_states.update(alert.alert_id, "received", level=alert.level)
         metrics.incr("pipeline.alert.received")
         route_decision = route_decision or self.router.decide(alert)
+        intent_decision = self.intent_classifier.classify(alert)
         pipeline_states.update(
             alert.alert_id,
             "routed",
             route=route_decision.route,
             priority=route_decision.priority,
+            intent=intent_decision.category,
         )
         metrics.incr(f"pipeline.route.{route_decision.route}")
+        metrics.incr(f"pipeline.intent.{intent_decision.category}")
         _pipeline_logger.audit_event(
             "alert_routed",
             {
@@ -73,7 +80,14 @@ class AIOpsPipeline:
                 "route": route_decision.route,
                 "priority": route_decision.priority,
                 "reason": route_decision.reason,
+                "intent": intent_decision.category,
+                "intent_reason": intent_decision.reason,
             },
+        )
+        print(
+            "[Pipeline] 意图识别: "
+            f"category={intent_decision.category} confidence={intent_decision.confidence} "
+            f"reason={intent_decision.reason}"
         )
 
         if route_decision.route == "manual_first":
@@ -108,13 +122,29 @@ class AIOpsPipeline:
             success_counter="pipeline.knowledge_search.success",
             failure_counter="pipeline.knowledge_search.failure",
         ):
-            sops = self.kb.search_experience(f"{alert.title} {alert.content}")
+            search_query = (
+                f"category={intent_decision.category} "
+                f"{alert.title} {alert.content}"
+            )
+            sops = self.kb.search_experience(search_query)
+            jira_cases = self._search_jira_cases(alert)
+            if jira_cases:
+                sops = list(sops) + jira_cases
 
         # 1.1 调用可选 skills
         pipeline_states.update(alert.alert_id, "skills_running")
         skill_results = self.skill_registry.run(
             alert,
-            {"history_sops": sops, "alert": alert.model_dump()},
+            {
+                "history_sops": sops,
+                "alert": alert.model_dump(),
+                "intent": {
+                    "category": intent_decision.category,
+                    "confidence": intent_decision.confidence,
+                    "reason": intent_decision.reason,
+                    "tags": intent_decision.tags,
+                },
+            },
         )
         if skill_results:
             print(
@@ -320,6 +350,19 @@ class AIOpsPipeline:
             if tid:
                 ticket_ids.append(tid)
         return ticket_ids
+
+    def _search_jira_cases(self, alert: Alert) -> List[str]:
+        if self.jira_knowledge_retriever is None:
+            return []
+        try:
+            cases = self.jira_knowledge_retriever.search_for_alert(alert)
+            formatted = self.jira_knowledge_retriever.format_cases(cases)
+            if formatted:
+                print(f"[Pipeline] 命中 Jira 历史案例 {len(cases)} 条")
+            return formatted
+        except Exception as exc:
+            print(f"[Pipeline] [WARN] Jira 历史案例检索失败，已降级: {exc}")
+            return []
 
     @staticmethod
     def _build_manual_route_plan(reason: str):

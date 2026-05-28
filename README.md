@@ -100,24 +100,9 @@ python main.py
 ## 语义检索（自定义 Embedding API）
 `PostgresVectorKnowledgeBase` 支持通过 `.env` 切换 embedding 提供方，无需改代码。
 
-### 共享远程 API 配置
-如果 embedding 和 rerank 共用同一套网关/鉴权，可优先配置共享项，避免在 `.env` 重复填写：
-
-```bash
-AIOPS_REMOTE_API_BASE_URL=https://your-gateway/v1
-AIOPS_REMOTE_API_KEY=your_key
-AIOPS_REMOTE_API_KEY_HEADER=Authorization
-AIOPS_REMOTE_API_KEY_PREFIX=Bearer
-AIOPS_REMOTE_API_TIMEOUT_SECONDS=20
-```
-
-说明：
-- 当未单独指定 `AIOPS_EMBEDDING_API_URL` 时，默认拼接为 `${AIOPS_REMOTE_API_BASE_URL}/embeddings`
-- 当未单独指定 `AIOPS_RERANK_API_URL` 时，默认拼接为 `${AIOPS_REMOTE_API_BASE_URL}/rerank`
-- embedding / rerank 的专用配置仍然有效，且优先级高于共享配置
-
 ### Provider 配置
 ```bash
+AIOPS_EMBEDDING_ENABLED=1
 AIOPS_EMBEDDING_PROVIDER=custom_api
 AIOPS_EMBEDDING_API_URL=https://your-embedding-endpoint/v1/embeddings
 AIOPS_EMBEDDING_API_KEY=your_key
@@ -132,9 +117,11 @@ AIOPS_EMBEDDING_FALLBACK_LOCAL=1
 ```
 
 字段说明：
+- `AIOPS_EMBEDDING_ENABLED`: `1` 表示启用外部 embedding 配置；`0` 表示不需要配置外部向量模型，使用内置确定性本地向量。
 - `AIOPS_EMBEDDING_PROVIDER`: `local` 或 `custom_api`
 - `AIOPS_EMBEDDING_VECTOR_PATH`: 从响应体提取向量的路径，支持 `a.b.0.c` 形式
 - `AIOPS_EMBEDDING_FALLBACK_LOCAL=1`: API失败时自动回退本地向量；设为 `0` 则直接抛错
+- `AIOPS_EMBEDDING_MODEL`: 可为空；为空时请求体不传 `model` 字段。
 
 维度对齐要求：
 - embedding 返回向量长度必须等于 `AIOPS_PG_VECTOR_DIM`，且与表中 `vector(dim)` 一致。
@@ -162,6 +149,8 @@ AIOPS_RERANK_FALLBACK_VECTOR=1
 
 说明：
 - `AIOPS_RERANK_ENABLED=0` 时不走重排，保持当前向量检索结果。
+- `AIOPS_RERANK_MODEL` 可为空；为空时请求体不传 `model` 字段。
+- `AIOPS_RERANK_ENABLED=1` 但没有配置 `AIOPS_RERANK_API_URL` 时，会尝试使用 `${AIOPS_LLM_BASE_URL}/rerank`；如果仍为空，则自动跳过重排。
 - `AIOPS_RERANK_CANDIDATE_K` 表示向量初召回数量，rerank 后截断到 `AIOPS_PG_TOP_K`。
 
 ## 近似去重配置

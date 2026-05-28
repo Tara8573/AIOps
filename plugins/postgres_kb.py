@@ -35,8 +35,11 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         )
         self.vector_dim = vector_dim
         self.top_k = top_k
+        self.embedding_enabled = os.getenv("AIOPS_EMBEDDING_ENABLED", "1") == "1"
         self.embedding_provider = (
             os.getenv("AIOPS_EMBEDDING_PROVIDER", "local").strip().lower()
+            if self.embedding_enabled
+            else "local"
         )
         self.embedding_api_url = self._get_service_url(
             "AIOPS_EMBEDDING_API_URL", "/embeddings"
@@ -163,7 +166,7 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         value = self._get_env(primary).strip()
         if value:
             return value
-        base_url = self._get_env("AIOPS_REMOTE_API_BASE_URL").strip()
+        base_url = self._get_env("AIOPS_LLM_BASE_URL").strip()
         if not base_url:
             return ""
         return urljoin(f"{base_url.rstrip('/')}/", default_path.lstrip("/"))
@@ -466,6 +469,8 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         return [float(v) for v in vector]
 
     def _embed_text(self, text: str) -> List[float]:
+        if not self.embedding_enabled:
+            return self._embed_text_local(text)
         if self.embedding_provider == "local":
             return self._embed_text_local(text)
         if self.embedding_provider == "custom_api":
@@ -566,7 +571,7 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                 cur.execute(sql, (Vector(embedding), candidate_k))
                 rows = cur.fetchall()
         experiences = [row[0] for row in rows]
-        if self.rerank_enabled and experiences:
+        if self.rerank_enabled and experiences and self.rerank_api_url:
             try:
                 reranked = self._rerank_docs_custom_api(alert_feature, experiences)
                 experiences = reranked[: self.top_k]
@@ -585,6 +590,8 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                 experiences = experiences[: self.top_k]
                 print(f"[PostgresKB] rerank 失败, 回退向量排序: {exc}")
         else:
+            if self.rerank_enabled and experiences and not self.rerank_api_url:
+                print("[PostgresKB] rerank 已开启但未配置 API URL，跳过重排")
             experiences = experiences[: self.top_k]
         print(f"[PostgresKB] 检索经验 {len(experiences)} 条: {alert_feature}")
         self.search_cache.set(cache_key, list(experiences))

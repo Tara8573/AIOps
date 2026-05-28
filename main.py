@@ -45,6 +45,19 @@ def build_kb():
     return kb
 
 
+def build_jira_retriever():
+    if os.getenv("AIOPS_USE_JIRA_KNOWLEDGE", "0") != "1":
+        return None
+
+    from knowledge.jira_retriever import JiraKnowledgeRetriever
+    from knowledge.jira_store import SQLiteJiraKnowledgeStore
+
+    return JiraKnowledgeRetriever(
+        store=SQLiteJiraKnowledgeStore(os.getenv("JIRA_KNOWLEDGE_DB")),
+        top_k=int(os.getenv("JIRA_KNOWLEDGE_TOP_K", "5")),
+    )
+
+
 def _resolve_env_value(*names: str, default: str = "") -> str:
     for name in names:
         value = os.getenv(name)
@@ -67,20 +80,13 @@ def build_llm():
     if provider == "openai":
         api_key = _resolve_env_value(
             "AIOPS_LLM_API_KEY",
-            "OPENAI_API_KEY",
-            "DEEPSEEK_API_KEY",
         )
         base_url = _resolve_env_value(
             "AIOPS_LLM_BASE_URL",
-            "OPENAI_BASE_URL",
-            "DEEPSEEK_BASE_URL",
-            "AIOPS_REMOTE_API_BASE_URL",
             default="https://api.openai.com/v1",
         )
         model = _resolve_env_value(
             "AIOPS_LLM_MODEL",
-            "OPENAI_MODEL",
-            "DEEPSEEK_MODEL",
             default="deepseek-chat",
         )
         return LLMClientFactory.create(
@@ -194,6 +200,7 @@ def demo():
     approval_gate = MockApprovalGate()
     ticketing = MockJiraTicketing()
     skill_registry = SkillRegistry([DiskCleanupSkill()])
+    jira_retriever = build_jira_retriever()
 
     alert = Alert(
         alert_id="ALT-2023-0901",
@@ -210,6 +217,7 @@ def demo():
         approval_gate=approval_gate,
         ticketing=ticketing,
         skill_registry=skill_registry,
+        jira_knowledge_retriever=jira_retriever,
     )
     ticket_id = pipeline.process_alert(alert)
 
@@ -231,6 +239,7 @@ def run_kafka():
     approval_gate = MockApprovalGate()
     ticketing = MockJiraTicketing()
     skill_registry = SkillRegistry([DiskCleanupSkill()])
+    jira_retriever = build_jira_retriever()
 
     kafka_source = build_kafka_source()
     cleaner = build_cleaner()
@@ -246,6 +255,7 @@ def run_kafka():
         alert_source=kafka_source,
         alert_cleaner=cleaner,
         alert_filter=alert_filter,
+        jira_knowledge_retriever=jira_retriever,
     )
 
     print(
