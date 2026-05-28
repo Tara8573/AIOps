@@ -203,16 +203,62 @@ class AIOpsPipeline:
                         },
                     )
                     pipeline_states.update(alert.alert_id, "executing")
-                    with metrics.timer(
-                        "pipeline.execution.ms",
-                        success_counter="pipeline.execution.success",
-                        failure_counter="pipeline.execution.failure",
-                    ):
-                        self.executor.execute_script(
-                            proposal.plan.script_content, {"alert": alert.model_dump()}
+                    execution_success = False
+                    execution_failure_reason = ""
+                    try:
+                        with metrics.timer("pipeline.execution.ms"):
+                            execution_success = bool(
+                                self.executor.execute_script(
+                                    proposal.plan.script_content,
+                                    {"alert": alert.model_dump()},
+                                )
+                            )
+                    except Exception as exc:
+                        execution_failure_reason = f"脚本执行异常: {exc}"
+                    else:
+                        if not execution_success:
+                            execution_failure_reason = "脚本执行返回失败"
+
+                    if execution_success:
+                        metrics.incr("pipeline.execution.success")
+                        _pipeline_logger.execution_complete(alert.alert_id, True)
+                        pipeline_states.update(
+                            alert.alert_id, "resolved", route="auto_execute"
                         )
-                    _pipeline_logger.execution_complete(alert.alert_id, True)
-                    pipeline_states.update(alert.alert_id, "resolved", route="auto_execute")
+                    else:
+                        metrics.incr("pipeline.execution.failure")
+                        _pipeline_logger.execution_complete(alert.alert_id, False)
+                        _pipeline_logger.audit_event(
+                            "script_execution_failed",
+                            {
+                                "alert_id": alert.alert_id,
+                                "reason": execution_failure_reason,
+                                "risk_level": eval_result.risk_level,
+                            },
+                        )
+                        print(
+                            "[Pipeline] [FAIL] 自动修复执行失败 -> 提单至 Jira 人工辅助 "
+                            f"({execution_failure_reason})"
+                        )
+                        pipeline_states.update(
+                            alert.alert_id,
+                            "execution_failed",
+                            reason=execution_failure_reason,
+                        )
+                        ticket_id = self.ticketing.create_ticket(
+                            alert,
+                            proposal.plan,
+                            eval_reason=f"自动执行失败: {execution_failure_reason}",
+                        )
+                        _pipeline_logger.ticket_created(
+                            alert.alert_id, ticket_id, execution_failure_reason
+                        )
+                        pipeline_states.update(
+                            alert.alert_id,
+                            "ticket_created",
+                            route="auto_execute_failed",
+                            reason=execution_failure_reason,
+                        )
                 else:
                     print("[Pipeline] [BLOCK] 人工确认拒绝执行 -> 提单至 Jira 人工辅助")
                     _pipeline_logger.audit_event(

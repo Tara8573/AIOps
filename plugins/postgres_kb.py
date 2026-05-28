@@ -181,61 +181,81 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             with conn.cursor() as cur:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
                 cur.execute(
+                    "DROP TABLE IF EXISTS kb_experiences;"
+                )
+                cur.execute(
                     f"""
-                    CREATE TABLE IF NOT EXISTS kb_experiences (
+                    CREATE TABLE IF NOT EXISTS kb_fault_patterns (
                         id BIGSERIAL PRIMARY KEY,
                         source VARCHAR(64) NOT NULL DEFAULT 'manual',
-                        alert_feature TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        dedupe_key CHAR(32),
+                        canonical_root_cause TEXT NOT NULL,
+                        summary_content TEXT NOT NULL,
+                        dedupe_key CHAR(32) NOT NULL,
                         embedding vector({self.vector_dim}) NOT NULL,
+                        support_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS kb_incident_cases (
+                        id BIGSERIAL PRIMARY KEY,
+                        fault_pattern_id BIGINT NOT NULL
+                            REFERENCES kb_fault_patterns(id) ON DELETE CASCADE,
+                        source VARCHAR(64) NOT NULL DEFAULT 'manual',
+                        alert_id TEXT,
+                        ticket_id TEXT,
+                        actual_root_cause TEXT NOT NULL,
+                        resolution_steps TEXT NOT NULL,
+                        case_key CHAR(32) NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                     );
                     """
                 )
                 cur.execute(
                     """
-                    ALTER TABLE kb_experiences
-                    ADD COLUMN IF NOT EXISTS dedupe_key CHAR(32);
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_fault_patterns_dedupe_key
+                    ON kb_fault_patterns(dedupe_key);
                     """
                 )
                 cur.execute(
                     """
-                    UPDATE kb_experiences
-                    SET dedupe_key = md5(
-                        lower(
-                            regexp_replace(trim(alert_feature), '\s+', ' ', 'g')
-                        ) || '|' || lower(
-                            regexp_replace(trim(content), '\s+', ' ', 'g')
-                        )
-                    )
-                    WHERE dedupe_key IS NULL;
+                    CREATE INDEX IF NOT EXISTS idx_kb_fault_patterns_updated_at
+                    ON kb_fault_patterns(updated_at DESC);
                     """
                 )
                 cur.execute(
                     """
-                    DELETE FROM kb_experiences a
-                    USING kb_experiences b
-                    WHERE a.id < b.id
-                      AND a.dedupe_key = b.dedupe_key;
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_incident_cases_case_key
+                    ON kb_incident_cases(case_key);
                     """
                 )
                 cur.execute(
                     """
-                    CREATE INDEX IF NOT EXISTS idx_kb_experiences_created_at
-                    ON kb_experiences(created_at DESC);
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_experiences_dedupe_key
-                    ON kb_experiences(dedupe_key);
+                    CREATE INDEX IF NOT EXISTS idx_kb_incident_cases_pattern_id
+                    ON kb_incident_cases(fault_pattern_id);
                     """
                 )
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        return re.findall(r"[a-zA-Z0-9_/\-\.]+", text.lower())
+        lowered = text.lower()
+        tokens = re.findall(r"[a-zA-Z0-9_/\-\.]+", lowered)
+        chinese_segments = re.findall(r"[\u4e00-\u9fff]+", lowered)
+        for segment in chinese_segments:
+            if len(segment) == 1:
+                tokens.append(segment)
+                continue
+            tokens.extend(
+                segment[idx : idx + 2] for idx in range(len(segment) - 1)
+            )
+            if len(segment) > 2:
+                tokens.extend(
+                    segment[idx : idx + 3] for idx in range(len(segment) - 2)
+                )
+        return tokens
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -246,6 +266,71 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             f"{self._normalize_text(alert_feature)}|{self._normalize_text(content)}"
         )
         return hashlib.md5(normalized.encode("utf-8")).hexdigest()
+
+    def _build_pattern_key(self, canonical_root_cause: str) -> str:
+        return hashlib.md5(
+            self._normalize_text(canonical_root_cause).encode("utf-8")
+        ).hexdigest()
+
+    def _build_case_key(
+        self, alert_id: Optional[str], ticket_id: Optional[str], root_cause: str
+    ) -> str:
+        identity = ticket_id or alert_id
+        if identity:
+            raw = f"case|{self._normalize_text(identity)}"
+        else:
+            raw = f"case|{self._normalize_text(root_cause)}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _canonicalize_root_cause(root_cause: str) -> str:
+        text = re.sub(r"\s+", "", root_cause.strip().lower())
+        replacements = [
+            ("服务异常的根因是", ""),
+            ("系统", ""),
+            ("服务异常", ""),
+            ("导致", ""),
+            ("造成", ""),
+            ("引起", ""),
+            ("的根因是", ""),
+            ("根因是", ""),
+            ("根因", ""),
+            ("被", ""),
+            ("空间", ""),
+            ("文件", ""),
+        ]
+        for old, new in replacements:
+            text = text.replace(old, new)
+
+        synonym_groups = [
+            (
+                (
+                    "日志打满磁盘",
+                    "日志占满磁盘",
+                    "磁盘被日志打满",
+                    "磁盘日志打满",
+                    "磁盘日志占满",
+                ),
+                "日志占满磁盘",
+            ),
+            (("磁盘满", "磁盘占满", "磁盘空间满"), "磁盘占满"),
+            (("过期日志", "旧日志"), "过期日志"),
+        ]
+        for variants, canonical in synonym_groups:
+            if any(variant in text for variant in variants):
+                text = canonical
+                break
+        return text or root_cause.strip()
+
+    def _build_pattern_content(
+        self, canonical_root_cause: str, resolution_steps: str, support_count: int = 1
+    ) -> str:
+        return (
+            "故障模式经验: "
+            f"canonical_root_cause={canonical_root_cause}; "
+            f"recommended_resolution={resolution_steps}; "
+            f"related_cases={support_count}"
+        )
 
     @staticmethod
     def _compose_feedback_feature(feedback: Feedback) -> str:
@@ -313,8 +398,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             return None
 
         sql = """
-            SELECT id, source, alert_feature, content, dedupe_key, created_at, embedding <=> %s AS distance
-            FROM kb_experiences
+            SELECT id, source, canonical_root_cause, summary_content, dedupe_key,
+                   updated_at, support_count, embedding <=> %s AS distance
+            FROM kb_fault_patterns
             WHERE dedupe_key <> %s
             ORDER BY embedding <=> %s
             LIMIT %s;
@@ -340,7 +426,7 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             sequence_similarity = self._sequence_similarity(
                 incoming_text, existing_text
             )
-            distance = float(row[6])
+            distance = float(row[7])
             if (
                 (
                     distance <= self.approx_dedupe_distance_threshold
@@ -356,6 +442,7 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                     "content": row[3],
                     "dedupe_key": row[4],
                     "created_at": row[5],
+                    "support_count": row[6],
                     "distance": distance,
                     "overlap_ratio": overlap_ratio,
                     "char_similarity": char_similarity,
@@ -363,38 +450,136 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                 }
         return None
 
-    def _insert_experience(self, source: str, alert_feature: str, content: str) -> bool:
-        dedupe_key = self._build_dedupe_key(alert_feature, content)
-        embedding = self._embed_text(f"{alert_feature} {content}")
+    def _upsert_fault_pattern(
+        self, source: str, root_cause: str, resolution_steps: str
+    ) -> tuple[int, bool]:
+        canonical_root_cause = self._canonicalize_root_cause(root_cause)
+        content = self._build_pattern_content(canonical_root_cause, resolution_steps)
+        dedupe_key = self._build_pattern_key(canonical_root_cause)
+        embedding = self._embed_text(f"{canonical_root_cause} {resolution_steps}")
+
+        exact_sql = """
+            SELECT id
+            FROM kb_fault_patterns
+            WHERE dedupe_key = %s;
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(exact_sql, (dedupe_key,))
+                row = cur.fetchone()
+                if row:
+                    return int(row[0]), False
+
         approx_duplicate = self._find_approx_duplicate(
             source=source,
-            alert_feature=alert_feature,
+            alert_feature=canonical_root_cause,
             content=content,
             dedupe_key=dedupe_key,
             embedding=embedding,
         )
         if approx_duplicate is not None:
             print(
-                "[PostgresKB] 跳过近似重复经验: "
+                "[PostgresKB] 归并到近似故障模式: "
                 f"existing_id={approx_duplicate['id']}, "
                 f"distance={approx_duplicate['distance']:.4f}, "
                 f"overlap={approx_duplicate['overlap_ratio']:.2f}, "
                 f"char_similarity={approx_duplicate['char_similarity']:.2f}, "
                 f"sequence_similarity={approx_duplicate['sequence_similarity']:.2f}"
             )
-            return False
+            return int(approx_duplicate["id"]), False
 
         sql = """
-            INSERT INTO kb_experiences(source, alert_feature, content, dedupe_key, embedding)
+            INSERT INTO kb_fault_patterns(
+                source, canonical_root_cause, summary_content, dedupe_key, embedding
+            )
             VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (dedupe_key) DO NOTHING;
+            RETURNING id;
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    sql, (source, alert_feature, content, dedupe_key, Vector(embedding))
+                    sql,
+                    (
+                        source,
+                        canonical_root_cause,
+                        content,
+                        dedupe_key,
+                        Vector(embedding),
+                    ),
                 )
-                return cur.rowcount > 0
+                row = cur.fetchone()
+                return int(row[0]), True
+
+    def _insert_incident_case(
+        self,
+        fault_pattern_id: int,
+        source: str,
+        actual_root_cause: str,
+        resolution_steps: str,
+        alert_id: Optional[str] = None,
+        ticket_id: Optional[str] = None,
+    ) -> bool:
+        case_key = self._build_case_key(alert_id, ticket_id, actual_root_cause)
+        sql = """
+            INSERT INTO kb_incident_cases(
+                fault_pattern_id, source, alert_id, ticket_id,
+                actual_root_cause, resolution_steps, case_key
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (case_key) DO NOTHING;
+        """
+        update_sql = """
+            UPDATE kb_fault_patterns
+            SET support_count = support_count + 1,
+                summary_content = %s,
+                updated_at = now()
+            WHERE id = %s;
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    (
+                        fault_pattern_id,
+                        source,
+                        alert_id,
+                        ticket_id,
+                        actual_root_cause,
+                        resolution_steps,
+                        case_key,
+                    ),
+                )
+                inserted = cur.rowcount > 0
+                if inserted:
+                    cur.execute(
+                        """
+                        SELECT canonical_root_cause, support_count
+                        FROM kb_fault_patterns
+                        WHERE id = %s;
+                        """,
+                        (fault_pattern_id,),
+                    )
+                    row = cur.fetchone()
+                    support_count = int(row[1]) + 1 if row else 1
+                    summary = self._build_pattern_content(
+                        row[0] if row else actual_root_cause,
+                        resolution_steps,
+                        support_count,
+                    )
+                    cur.execute(update_sql, (summary, fault_pattern_id))
+                return inserted
+
+    def _insert_experience(self, source: str, alert_feature: str, content: str) -> bool:
+        pattern_id, pattern_created = self._upsert_fault_pattern(
+            source, alert_feature, content
+        )
+        case_inserted = self._insert_incident_case(
+            pattern_id,
+            source,
+            actual_root_cause=alert_feature,
+            resolution_steps=content,
+        )
+        return pattern_created or case_inserted
 
     def _embed_text_local(self, text: str) -> List[float]:
         """Deterministic local embedding for fallback/demo."""
@@ -557,8 +742,8 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         metrics.incr("kb.search.cache.miss")
         embedding = self._embed_text(alert_feature)
         sql = """
-            SELECT content
-            FROM kb_experiences
+            SELECT summary_content
+            FROM kb_fault_patterns
             ORDER BY embedding <=> %s
             LIMIT %s;
         """
@@ -599,16 +784,27 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         return experiences
 
     def learn_new_experience(self, feedback: Feedback) -> bool:
-        alert_feature = self._compose_feedback_feature(feedback)
-        content = self._build_experience_content(
+        pattern_id, pattern_created = self._upsert_fault_pattern(
+            "jira_feedback",
+            feedback.actual_root_cause,
+            feedback.resolution_steps,
+        )
+        case_inserted = self._insert_incident_case(
+            pattern_id,
+            "jira_feedback",
             actual_root_cause=feedback.actual_root_cause,
             resolution_steps=feedback.resolution_steps,
+            alert_id=feedback.alert_id,
+            ticket_id=feedback.ticket_id,
         )
-        inserted = self._insert_experience("jira_feedback", alert_feature, content)
+        inserted = pattern_created or case_inserted
         if inserted:
-            print(f"[PostgresKB] 已沉淀新经验: alert={feedback.alert_id}")
+            print(
+                "[PostgresKB] 已沉淀事件案例并关联故障模式: "
+                f"alert={feedback.alert_id}, pattern_id={pattern_id}"
+            )
         else:
-            print(f"[PostgresKB] 跳过重复经验: alert={feedback.alert_id}")
+            print(f"[PostgresKB] 跳过重复事件案例: alert={feedback.alert_id}")
         return inserted
 
     def seed_experience(
