@@ -1,0 +1,296 @@
+{
+  "version": "1.0",
+  "description": "AIOps ActionPlan 质量评估集",
+  "cases": [
+    {
+      "case_id": "disk-001",
+      "alert": {
+        "alert_id": "EVAL-DISK-001",
+        "title": "Disk Space Critical on /var",
+        "level": "Critical",
+        "content": "Host web-01 disk usage > 98% on /var partition, service logs growing rapidly"
+      },
+      "expected": {
+        "root_cause_keywords": ["磁盘", "disk", "空间", "space", "日志", "log", "/var"],
+        "root_cause_category": "disk",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["df", "du", "ls", "清理", "clean", "日志", "log"],
+        "expect_script": true,
+        "script_keywords": ["df", "du", "find", "rm", "truncate", "logrotate"],
+        "min_confidence": 0.6,
+        "max_confidence": 1.0
+      },
+      "tags": ["disk", "critical"]
+    },
+    {
+      "case_id": "disk-002",
+      "alert": {
+        "alert_id": "EVAL-DISK-002",
+        "title": "Inode exhaustion on /data",
+        "level": "Warning",
+        "content": "Partition /data has 0 inodes free, many small files in cache directory"
+      },
+      "expected": {
+        "root_cause_keywords": ["inode", "文件", "file", "缓存", "cache"],
+        "root_cause_category": "disk",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["df -i", "find", "ls", "清理"],
+        "expect_script": true,
+        "script_keywords": ["find", "rm", "xargs"],
+        "min_confidence": 0.5,
+        "max_confidence": 1.0
+      },
+      "tags": ["disk", "warning"]
+    },
+    {
+      "case_id": "memory-001",
+      "alert": {
+        "alert_id": "EVAL-MEM-001",
+        "title": "OOM Killer triggered on worker-node-3",
+        "level": "Critical",
+        "content": "Kernel OOM killer invoked, process java-app killed. Available memory: 128MB, total 16GB"
+      },
+      "expected": {
+        "root_cause_keywords": ["内存", "memory", "OOM", "泄漏", "leak", "heap", "进程"],
+        "root_cause_category": "memory",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["free", "top", "ps", "jmap", "heap", "内存"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.9
+      },
+      "tags": ["memory", "critical", "oom"]
+    },
+    {
+      "case_id": "memory-002",
+      "alert": {
+        "alert_id": "EVAL-MEM-002",
+        "title": "High memory usage on db-server",
+        "level": "Warning",
+        "content": "db-server memory usage 92%, mysql process consuming 70% of total RAM"
+      },
+      "expected": {
+        "root_cause_keywords": ["内存", "memory", "MySQL", "mysql", "数据库"],
+        "root_cause_category": "memory",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["free", "top", "ps", "mysql", "buffer", "pool"],
+        "expect_script": false,
+        "min_confidence": 0.5,
+        "max_confidence": 0.95
+      },
+      "tags": ["memory", "database", "warning"]
+    },
+    {
+      "case_id": "cpu-001",
+      "alert": {
+        "alert_id": "EVAL-CPU-001",
+        "title": "CPU usage 100% on api-gateway",
+        "level": "Critical",
+        "content": "api-gateway-02 CPU at 100% for 15 minutes, request latency > 5s, thread count 800+"
+      },
+      "expected": {
+        "root_cause_keywords": ["CPU", "cpu", "线程", "thread", "死循环", "循环", "负载"],
+        "root_cause_category": "cpu",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["top", "ps", "thread", "jstack", "strace"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.95
+      },
+      "tags": ["cpu", "critical"]
+    },
+    {
+      "case_id": "network-001",
+      "alert": {
+        "alert_id": "EVAL-NET-001",
+        "title": "Connection timeout to upstream service",
+        "level": "Critical",
+        "content": "Service order-api cannot reach payment-service:8080, connection timeout after 30s, 503 errors increasing"
+      },
+      "expected": {
+        "root_cause_keywords": ["网络", "network", "连接", "connection", "超时", "timeout", "upstream"],
+        "root_cause_category": "network",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["ping", "telnet", "curl", "netstat", "ss", "telnet", "防火墙"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.95
+      },
+      "tags": ["network", "critical"]
+    },
+    {
+      "case_id": "network-002",
+      "alert": {
+        "alert_id": "EVAL-NET-002",
+        "title": "High packet loss on eth0",
+        "level": "Warning",
+        "content": "Network interface eth0 showing 15% packet loss, affecting all services on host gateway-01"
+      },
+      "expected": {
+        "root_cause_keywords": ["丢包", "packet", "网络", "network", "接口", "interface"],
+        "root_cause_category": "network",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["ping", "ifconfig", "ethtool", "tcpdump", "netstat"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.95
+      },
+      "tags": ["network", "warning"]
+    },
+    {
+      "case_id": "service-001",
+      "alert": {
+        "alert_id": "EVAL-SVC-001",
+        "title": "Service crash loop: user-service",
+        "level": "Critical",
+        "content": "Pod user-service-7b9f4c-abc12 restarting repeatedly, OOMKilled 5 times in 10 minutes, k8s CrashLoopBackOff"
+      },
+      "expected": {
+        "root_cause_keywords": ["重启", "restart", "OOM", "内存", "memory", "Pod", "pod", "CrashLoop"],
+        "root_cause_category": "service",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["kubectl", "describe", "logs", "events", "OOM", "memory"],
+        "expect_script": false,
+        "min_confidence": 0.5,
+        "max_confidence": 0.95
+      },
+      "tags": ["service", "critical", "kubernetes"]
+    },
+    {
+      "case_id": "service-002",
+      "alert": {
+        "alert_id": "EVAL-SVC-002",
+        "title": "HTTP 5xx error rate > 10%",
+        "level": "Critical",
+        "content": "api-server 5xx error rate spiked to 15%, avg response time 8s, downstream Redis connection pool exhausted"
+      },
+      "expected": {
+        "root_cause_keywords": ["错误", "error", "5xx", "Redis", "redis", "连接", "connection"],
+        "root_cause_category": "service",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["curl", "logs", "redis", "connection", "pool"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.95
+      },
+      "tags": ["service", "critical"]
+    },
+    {
+      "case_id": "database-001",
+      "alert": {
+        "alert_id": "EVAL-DB-001",
+        "title": "MySQL replication lag > 60s",
+        "level": "Warning",
+        "content": "MySQL slave db-slave-02 replication lag 65 seconds, Seconds_Behind_Master increasing, large batch INSERT on master"
+      },
+      "expected": {
+        "root_cause_keywords": ["复制", "replication", "延迟", "lag", "MySQL", "mysql", "主从"],
+        "root_cause_category": "database",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["SHOW SLAVE STATUS", "SHOW PROCESSLIST", "binlog", "relay"],
+        "expect_script": false,
+        "min_confidence": 0.5,
+        "max_confidence": 0.95
+      },
+      "tags": ["database", "warning", "mysql"]
+    },
+    {
+      "case_id": "database-002",
+      "alert": {
+        "alert_id": "EVAL-DB-002",
+        "title": "PostgreSQL connection pool exhausted",
+        "level": "Critical",
+        "content": "PostgreSQL max_connections reached (100/100), new connections refused, app getting 'too many clients' error"
+      },
+      "expected": {
+        "root_cause_keywords": ["连接", "connection", "PostgreSQL", "postgres", "连接池", "pool"],
+        "root_cause_category": "database",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["pg_stat_activity", "max_connections", "idle", "连接"],
+        "expect_script": false,
+        "min_confidence": 0.5,
+        "max_confidence": 0.95
+      },
+      "tags": ["database", "critical", "postgresql"]
+    },
+    {
+      "case_id": "config-001",
+      "alert": {
+        "alert_id": "EVAL-CFG-001",
+        "title": "Configuration drift detected",
+        "level": "Warning",
+        "content": "Nginx config on lb-01 differs from baseline: worker_connections changed from 1024 to 256, causing request queuing"
+      },
+      "expected": {
+        "root_cause_keywords": ["配置", "config", "Nginx", "nginx", "变更", "change", "worker_connections"],
+        "root_cause_category": "config",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["diff", "nginx", "config", "检查", "对比"],
+        "expect_script": true,
+        "script_keywords": ["nginx", "diff", "cp", "restore"],
+        "min_confidence": 0.5,
+        "max_confidence": 1.0
+      },
+      "tags": ["config", "warning"]
+    },
+    {
+      "case_id": "security-001",
+      "alert": {
+        "alert_id": "EVAL-SEC-001",
+        "title": "Brute force SSH login detected",
+        "level": "Critical",
+        "content": "Multiple failed SSH login attempts from IP 203.0.113.50, 500+ attempts in 5 minutes on host bastion-01"
+      },
+      "expected": {
+        "root_cause_keywords": ["暴力", "brute", "SSH", "ssh", "登录", "login", "攻击", "attack"],
+        "root_cause_category": "security",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["fail2ban", "iptables", "auth.log", "who", "last", "封禁"],
+        "expect_script": true,
+        "script_keywords": ["iptables", "fail2ban", "deny", "ban"],
+        "min_confidence": 0.5,
+        "max_confidence": 1.0
+      },
+      "tags": ["security", "critical"]
+    },
+    {
+      "case_id": "disk-003",
+      "alert": {
+        "alert_id": "EVAL-DISK-003",
+        "title": "Disk I/O latency high on storage node",
+        "level": "Warning",
+        "content": "Storage node nas-01 disk I/O await > 200ms, iowait 45%, affecting NFS mount points on app servers"
+      },
+      "expected": {
+        "root_cause_keywords": ["IO", "io", "IOPS", "延迟", "latency", "磁盘", "disk", "NFS"],
+        "root_cause_category": "disk",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["iostat", "iotop", "vmstat", "df", "mount"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.9
+      },
+      "tags": ["disk", "warning", "io"]
+    },
+    {
+      "case_id": "service-003",
+      "alert": {
+        "alert_id": "EVAL-SVC-003",
+        "title": "Certificate expiring in 3 days",
+        "level": "Warning",
+        "content": "TLS certificate for api.example.com expires on 2026-06-01, affects all HTTPS endpoints"
+      },
+      "expected": {
+        "root_cause_keywords": ["证书", "certificate", "TLS", "tls", "SSL", "ssl", "过期", "expire"],
+        "root_cause_category": "config",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["openssl", "cert", "证书", "renew", "到期"],
+        "expect_script": true,
+        "script_keywords": ["openssl", "certbot", "renew", "acme"],
+        "min_confidence": 0.6,
+        "max_confidence": 1.0
+      },
+      "tags": ["config", "security", "warning"]
+    }
+  ]
+}

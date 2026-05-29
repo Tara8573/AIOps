@@ -8,6 +8,22 @@ from core.observability import metrics
 from interfaces.base import ILLMClient
 
 
+def parse_action_plan_json(response_text: str) -> ActionPlan:
+    """解析 LLM 返回的 JSON 字符串为 ActionPlan。
+
+    复用于 eval_runner，避免重复解析逻辑。
+    """
+    cleaned_text = response_text.strip()
+    if cleaned_text.startswith("```json"):
+        cleaned_text = cleaned_text[7:]
+    if cleaned_text.startswith("```"):
+        cleaned_text = cleaned_text[3:]
+    if cleaned_text.endswith("```"):
+        cleaned_text = cleaned_text[:-3]
+    data = json.loads(cleaned_text.strip())
+    return ActionPlan(**data)
+
+
 class CognitiveEngine:
     """认知引擎：封装与大模型对话、Prompt工程及结构化解析的过程"""
 
@@ -61,17 +77,7 @@ class CognitiveEngine:
         response_text = self.llm_client.generate_proposal(prompt)
 
         try:
-            # 清理可能的 markdown 代码块标记
-            cleaned_text = response_text.strip()
-            if cleaned_text.startswith("```json"):
-                cleaned_text = cleaned_text[7:]
-            if cleaned_text.startswith("```"):
-                cleaned_text = cleaned_text[3:]
-            if cleaned_text.endswith("```"):
-                cleaned_text = cleaned_text[:-3]
-
-            data = json.loads(cleaned_text.strip())
-            action_plan = ActionPlan(**data)
+            action_plan = parse_action_plan_json(response_text)
             self._proposal_cache.set(cache_key, action_plan.model_dump())
             return LLMProposal(alert_id=alert.alert_id, plan=action_plan)
         except Exception as e:
