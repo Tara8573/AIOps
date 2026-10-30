@@ -14,7 +14,7 @@ import psycopg
 from pgvector import Vector
 from pgvector.psycopg import register_vector
 
-from core.cache import TTLCache, stable_cache_key
+from core.cache import cache_factory, TTLCache, stable_cache_key
 from core.models import Feedback
 from core.observability import metrics
 from interfaces.base import IKnowledgeBase
@@ -29,10 +29,8 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         vector_dim: int = 1024,
         top_k: int = 3,
     ):
-        self.dsn = dsn or os.getenv(
-            "AIOPS_PG_DSN",
-            "postgresql://postgres:postgres@127.0.0.1:5432/aiops",
-        )
+        # 修复：DSN 收口到 pg_dsn()（AIOPS__PG__DSN > AIOPS_PG_DSN > kb.pg.dsn）
+        self.dsn = dsn or pg_dsn() or "postgresql://postgres:postgres@127.0.0.1:5432/aiops"
         self.vector_dim = vector_dim
         self.top_k = top_k
         self.embedding_enabled = os.getenv("AIOPS_EMBEDDING_ENABLED", "1") == "1"
@@ -118,26 +116,100 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         self.rerank_fallback_vector = (
             os.getenv("AIOPS_RERANK_FALLBACK_VECTOR", "1") == "1"
         )
-        self.approx_dedupe_enabled = (
-            os.getenv("AIOPS_KB_APPROX_DEDUPE_ENABLED", "1") == "1"
+        # 修复：配置收口 —— Settings（config/default.yaml kb.dedup.*/kb.search_cache.*，
+        # 支持 AIOPS__KB__DEDUP__* 覆盖）优先，旧式 env 名兼容；原仅读旧 env，
+        # YAML 配置成死配置
+        self.approx_dedupe_enabled = self._cfg_bool(
+            "kb.dedup.enabled", "AIOPS_KB_APPROX_DEDUPE_ENABLED", "1"
         )
-        self.approx_dedupe_candidate_k = int(
-            os.getenv("AIOPS_KB_APPROX_DEDUPE_CANDIDATE_K", "5")
+        self.approx_dedupe_candidate_k = self._cfg_int(
+            "kb.dedup.candidate_k", "AIOPS_KB_APPROX_DEDUPE_CANDIDATE_K", 5
         )
-        self.approx_dedupe_distance_threshold = float(
-            os.getenv("AIOPS_KB_APPROX_DEDUPE_DISTANCE_THRESHOLD", "0.08")
+        self.approx_dedupe_distance_threshold = self._cfg_float(
+            "kb.dedup.distance_threshold", "AIOPS_KB_APPROX_DEDUPE_DISTANCE_THRESHOLD", 0.08
         )
-        self.approx_dedupe_overlap_threshold = float(
-            os.getenv("AIOPS_KB_APPROX_DEDUPE_OVERLAP_THRESHOLD", "0.65")
+        self.approx_dedupe_overlap_threshold = self._cfg_float(
+            "kb.dedup.overlap_threshold", "AIOPS_KB_APPROX_DEDUPE_OVERLAP_THRESHOLD", 0.65
         )
-        self.approx_dedupe_text_similarity_threshold = float(
-            os.getenv("AIOPS_KB_APPROX_DEDUPE_TEXT_SIMILARITY_THRESHOLD", "0.72")
+        self.approx_dedupe_text_similarity_threshold = self._cfg_float(
+            "kb.dedup.text_similarity_threshold", "AIOPS_KB_APPROX_DEDUPE_TEXT_SIMILARITY_THRESHOLD", 0.72
         )
-        self.search_cache = TTLCache(
-            ttl_seconds=int(os.getenv("AIOPS_KB_SEARCH_CACHE_TTL_SECONDS", "300")),
-            max_size=int(os.getenv("AIOPS_KB_SEARCH_CACHE_MAX_SIZE", "256")),
+        # 负样本/事件案例召回距离阈值（修复：原无距离过滤，每次检索必带不相关负样本/案例）
+        self.negative_distance_threshold = self._cfg_float(
+            "kb.negative_distance_threshold", "AIOPS_KB_NEGATIVE_DISTANCE_THRESHOLD", 0.35
         )
+        self.incident_distance_threshold = self._cfg_float(
+            "kb.incident_distance_threshold", "AIOPS_KB_INCIDENT_DISTANCE_THRESHOLD", 0.35
+        )
+        # FR-2.1: 检索缓存外置（Redis 可用 → 多实例共享；否则本地）
+        self.search_cache = cache_factory(
+            ttl_seconds=self._cfg_int(
+                "kb.search_cache.ttl_seconds", "AIOPS_KB_SEARCH_CACHE_TTL_SECONDS", 300
+            ),
+            max_size=self._cfg_int(
+                "kb.search_cache.max_size", "AIOPS_KB_SEARCH_CACHE_MAX_SIZE", 256
+            ),
+        )
+        # DB 会话角色（RBAC RLS current_setting('aiops.role')，修复：原无任何代码
+        # 设置该变量 → RLS 策略全空。默认 service（pipeline 业务角色）；
+        # 注意：超级用户连接仍绕过 RLS，生产应使用非超管账号（见 sql/rbac.sql）
+        self._db_role = self._cfg_str("kb.db_role", "AIOPS_DB_ROLE", "service")
         self._ensure_schema()
+        self._check_provider_consistency()
+
+    # ── 配置读取助手（Settings 优先，旧式 env 兼容）──
+
+    @staticmethod
+    def _cfg_value(yaml_path: str):
+        try:
+            from core.config import get_settings
+            return get_settings().get(yaml_path)
+        except Exception:
+            return None
+
+    @classmethod
+    def _cfg_str(cls, yaml_path: str, env_name: str, default: str) -> str:
+        v = cls._cfg_value(yaml_path)
+        if v is None:
+            v = os.getenv(env_name)
+        if v is None:
+            return default
+        return str(v).strip()
+
+    @classmethod
+    def _cfg_int(cls, yaml_path: str, env_name: str, default: int) -> int:
+        v = cls._cfg_value(yaml_path)
+        if v is None:
+            v = os.getenv(env_name)
+        if v is None or v == "":
+            return default
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _cfg_float(cls, yaml_path: str, env_name: str, default: float) -> float:
+        v = cls._cfg_value(yaml_path)
+        if v is None:
+            v = os.getenv(env_name)
+        if v is None or v == "":
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _cfg_bool(cls, yaml_path: str, env_name: str, default: str) -> bool:
+        v = cls._cfg_value(yaml_path)
+        if v is None:
+            v = os.getenv(env_name)
+        if v is None or v == "":
+            v = default
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _get_env(
@@ -174,6 +246,13 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
     def _connect(self):
         conn = psycopg.connect(self.dsn, autocommit=True)
         register_vector(conn)
+        # RBAC：会话角色变量（sql/rbac.sql 的 RLS 策略依赖 current_setting('aiops.role')）
+        if self._db_role:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SET aiops.role = %s", (self._db_role,))
+            except Exception:
+                pass  # 变量不存在/无权限时不阻断主链路
         return conn
 
     def _ensure_schema(self) -> None:
@@ -402,6 +481,7 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                    updated_at, support_count, embedding <=> %s AS distance
             FROM kb_fault_patterns
             WHERE dedupe_key <> %s
+              AND embedding_provider = %s
             ORDER BY embedding <=> %s
             LIMIT %s;
         """
@@ -412,6 +492,7 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                     (
                         Vector(embedding),
                         dedupe_key,
+                        self._current_embedding_provider(),
                         Vector(embedding),
                         self.approx_dedupe_candidate_k,
                     ),
@@ -490,9 +571,10 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
 
         sql = """
             INSERT INTO kb_fault_patterns(
-                source, canonical_root_cause, summary_content, dedupe_key, embedding
+                source, canonical_root_cause, summary_content, dedupe_key, embedding,
+                embedding_provider
             )
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING id;
         """
         with self._connect() as conn:
@@ -505,6 +587,7 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
                         content,
                         dedupe_key,
                         Vector(embedding),
+                        self._current_embedding_provider(),
                     ),
                 )
                 row = cur.fetchone()
@@ -653,6 +736,37 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             )
         return [float(v) for v in vector]
 
+
+    def _current_embedding_provider(self) -> str:
+        """当前实际产生向量的 provider 标识，写入 embedding_provider 列。
+        检索只与相同 provider 的向量比较，避免 local/custom_api 两种向量空间混淆。"""
+        if not self.embedding_enabled:
+            return "local"
+        return self.embedding_provider or "local"
+
+    def _check_provider_consistency(self) -> None:
+        """启动自检：库中已有向量的 provider 与当前配置不一致时告警。
+        不同 provider 的向量空间不同，混存会让向量距离失去意义。"""
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT DISTINCT embedding_provider FROM kb_fault_patterns;"
+                    )
+                    providers = {row[0] for row in cur.fetchall()}
+        except Exception:
+            return  # 表不存在等场景由后续初始化处理
+        cur_provider = self._current_embedding_provider()
+        foreign = providers - {cur_provider}
+        if foreign:
+            msg = (
+                f"[PostgresKB] 知识库已存在 provider={sorted(foreign)} 的向量，"
+                f"当前配置 provider={cur_provider}。向量空间不同，检索结果将不可靠；"
+                f"请清空 kb_fault_patterns 重建，或切回原 provider。"
+            )
+            print(msg)
+            metrics.incr("kb.embedding.provider_mismatch")
+
     def _embed_text(self, text: str) -> List[float]:
         if not self.embedding_enabled:
             return self._embed_text_local(text)
@@ -741,21 +855,89 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
 
         metrics.incr("kb.search.cache.miss")
         embedding = self._embed_text(alert_feature)
-        sql = """
-            SELECT summary_content
-            FROM kb_fault_patterns
-            ORDER BY embedding <=> %s
-            LIMIT %s;
-        """
+
         candidate_k = self.top_k
         if self.rerank_enabled:
             candidate_k = max(self.top_k, self.rerank_candidate_k)
 
+        sql = """
+            SELECT summary_content,
+                   embedding <=> %s AS distance,
+                   support_count
+            FROM kb_fault_patterns
+            WHERE source != 'jira_negative_feedback'
+              AND embedding_provider = %s
+            ORDER BY (embedding <=> %s) - ln(support_count + 1) * %s
+            LIMIT %s;
+        """
+        support_weight = float(
+            os.getenv("AIOPS_KB_SUPPORT_COUNT_WEIGHT", "0.05")
+        )
+
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (Vector(embedding), candidate_k))
-                rows = cur.fetchall()
-        experiences = [row[0] for row in rows]
+                cur.execute(
+                    sql,
+                    (Vector(embedding), self._current_embedding_provider(), Vector(embedding), support_weight, candidate_k),
+                )
+                pattern_rows = cur.fetchall()
+
+        experiences = [row[0] for row in pattern_rows]
+
+        negative_sql = """
+            SELECT summary_content,
+                   embedding <=> %s AS distance
+            FROM kb_fault_patterns
+            WHERE source = 'jira_negative_feedback'
+              AND embedding_provider = %s
+              AND embedding <=> %s <= %s
+            ORDER BY distance
+            LIMIT %s;
+        """
+        negative_k = max(1, self.top_k // 3)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                # 修复：增加距离阈值 —— 原无距离过滤，无关负样本也必被召回污染 prompt
+                cur.execute(
+                    negative_sql,
+                    (Vector(embedding), self._current_embedding_provider(),
+                     Vector(embedding), self.negative_distance_threshold, negative_k),
+                )
+                negative_rows = cur.fetchall()
+
+        for row in negative_rows:
+            experiences.append(
+                f"[WARNING: 以下为历史误判案例，请勿重复此诊断] {row[0]}"
+            )
+
+        incident_sql = """
+            SELECT ic.actual_root_cause, ic.resolution_steps,
+                   fp.embedding <=> %s AS distance
+            FROM kb_incident_cases ic
+            JOIN kb_fault_patterns fp ON ic.fault_pattern_id = fp.id
+            WHERE fp.source != 'jira_negative_feedback'
+              AND fp.embedding_provider = %s
+              AND fp.embedding <=> %s <= %s
+            ORDER BY distance
+            LIMIT %s;
+        """
+        incident_case_k = max(2, self.top_k // 2)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                # 修复：增加距离阈值 —— 原无距离过滤，无关事件案例也必被召回
+                cur.execute(
+                    incident_sql,
+                    (Vector(embedding), self._current_embedding_provider(),
+                     Vector(embedding), self.incident_distance_threshold, incident_case_k),
+                )
+                incident_rows = cur.fetchall()
+
+        for row in incident_rows:
+            case_text = (
+                f"[历史事件案例] 根因: {row[0]}; 处置步骤: {row[1]}"
+            )
+            experiences.append(case_text)
+
         if self.rerank_enabled and experiences and self.rerank_api_url:
             try:
                 reranked = self._rerank_docs_custom_api(alert_feature, experiences)
@@ -778,20 +960,39 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
             if self.rerank_enabled and experiences and not self.rerank_api_url:
                 print("[PostgresKB] rerank 已开启但未配置 API URL，跳过重排")
             experiences = experiences[: self.top_k]
-        print(f"[PostgresKB] 检索经验 {len(experiences)} 条: {alert_feature}")
+
+        print(
+            f"[PostgresKB] 检索经验 {len(experiences)} 条 "
+            f"(故障模式 {len(pattern_rows)} + 事件案例 {len(incident_rows)}): "
+            f"{alert_feature}"
+        )
         self.search_cache.set(cache_key, list(experiences))
         metrics.gauge("kb.search.cache.size", self.search_cache.stats()["size"])
         return experiences
 
     def learn_new_experience(self, feedback: Feedback) -> bool:
-        pattern_id, pattern_created = self._upsert_fault_pattern(
-            "jira_feedback",
-            feedback.actual_root_cause,
-            feedback.resolution_steps,
-        )
+        is_negative = getattr(feedback, "feedback_type", "positive") == "negative"
+
+        if is_negative:
+            negative_content = (
+                f"[误判/失败案例] LLM 推测根因: {feedback.actual_root_cause}; "
+                f"实际处置: {feedback.resolution_steps}"
+            )
+            pattern_id, pattern_created = self._upsert_fault_pattern(
+                "jira_negative_feedback",
+                feedback.actual_root_cause,
+                negative_content,
+            )
+        else:
+            pattern_id, pattern_created = self._upsert_fault_pattern(
+                "jira_feedback",
+                feedback.actual_root_cause,
+                feedback.resolution_steps,
+            )
+
         case_inserted = self._insert_incident_case(
             pattern_id,
-            "jira_feedback",
+            "jira_negative_feedback" if is_negative else "jira_feedback",
             actual_root_cause=feedback.actual_root_cause,
             resolution_steps=feedback.resolution_steps,
             alert_id=feedback.alert_id,
@@ -799,8 +1000,9 @@ class PostgresVectorKnowledgeBase(IKnowledgeBase):
         )
         inserted = pattern_created or case_inserted
         if inserted:
+            label = "负样本" if is_negative else "事件案例"
             print(
-                "[PostgresKB] 已沉淀事件案例并关联故障模式: "
+                f"[PostgresKB] 已沉淀{label}并关联故障模式: "
                 f"alert={feedback.alert_id}, pattern_id={pattern_id}"
             )
         else:

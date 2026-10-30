@@ -1,10 +1,14 @@
 from core.models import Alert
 from core.llm_engine import CognitiveEngine
 from core.evaluator import SolutionEvaluator
+from core.pipeline_graph import run_pipeline
 from core.intent import AlertIntentClassifier
+from core.rule_engine import LocalRuleEngine
 from core.logger import get_logger
 from core.observability import metrics, pipeline_states
 from core.routing import AlertRouteDecision, AlertRouter, sort_alerts_by_priority
+from agents import DiagnosisAgent, EvaluationAgent, FeedbackAgent
+import threading
 from interfaces.base import (
     IKnowledgeBase,
     IExecutor,
@@ -14,13 +18,28 @@ from interfaces.base import (
     IAlertSource,
     IAlertCleaner,
     IAlertFilter,
+    IRuleEngine,
+    IDecisionClient,
 )
 from core.skills import SkillRegistry
 from typing import Any, Optional, List
 import os
+import re
 import time
 
 _pipeline_logger = get_logger("pipeline")
+
+
+def _extract_host(alert: Alert) -> str:
+    """从告警中提取主机标识，用于关联分析"""
+    text = f"{alert.title} {alert.content}"
+    ip_match = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", text)
+    if ip_match:
+        return ip_match.group(1)
+    host_match = re.search(r"(?:host|node|server)\s*[:=]?\s*(\S+)", text, re.IGNORECASE)
+    if host_match:
+        return host_match.group(1)
+    return ""
 
 
 class AIOpsPipeline:
@@ -38,275 +57,152 @@ class AIOpsPipeline:
         alert_cleaner: Optional[IAlertCleaner] = None,
         alert_filter: Optional[IAlertFilter] = None,
         jira_knowledge_retriever: Optional[Any] = None,
+        log_querier: Optional[Any] = None,
+        metrics_querier: Optional[Any] = None,
+        rule_engine: Any = "default",
+        diagnosis_llm: Optional[ILLMClient] = None,
+        evaluation_llm: Optional[ILLMClient] = None,
+        feedback_llm: Optional[ILLMClient] = None,
+        message_producer: Optional[Any] = None,
+        decision_client: Optional[IDecisionClient] = None,
+        checkpointer: Optional[Any] = None,
+        run_registry: Optional[Any] = None,
+        approval_store: Optional[Any] = None,
+        correlation_store: Optional[Any] = None,
+        runtime_config: Optional[Any] = None,
     ):
         self.kb = kb
+        self.llm_client = llm
         self.engine = CognitiveEngine(llm)
-        self.evaluator = SolutionEvaluator()
+        self.evaluator = SolutionEvaluator(
+            llm_client=llm if os.getenv("AIOPS_LLM_JUDGE_ENABLED", "0") == "1" else None
+        )
         self.executor = executor
         self.approval_gate = approval_gate
+        self.approval_store = approval_store
+        # FR-3：异步审批模式（sync=同步阻塞保持旧行为 | async=interrupt 挂起+Resumer 恢复）
+        self.approval_mode = os.getenv("AIOPS_APPROVAL_MODE", "sync").strip().lower()
         self.ticketing = ticketing
         self.skill_registry = skill_registry or SkillRegistry()
         self.alert_source = alert_source
         self.alert_cleaner = alert_cleaner
         self.alert_filter = alert_filter
         self.jira_knowledge_retriever = jira_knowledge_retriever
+        self.log_querier = log_querier
+        self.metrics_querier = metrics_querier
+        self.rule_engine = (
+            LocalRuleEngine() if rule_engine == "default" else rule_engine
+        )
         self.router = AlertRouter()
         self.intent_classifier = AlertIntentClassifier()
+
+        # ── Decision Engine（判别式决策抽象层）──
+        # 默认使用 RuleDecisionClient（确定性规则），零依赖零成本。
+        # 可通过注入 JevDecisionClient 切换到概率语义模型。
+        # 业务代码只依赖 IDecisionClient 接口，不感知具体实现。
+        if decision_client is not None:
+            self.decision_client = decision_client
+        else:
+            from plugins.rule_decision_client import RuleDecisionClient
+            self.decision_client = RuleDecisionClient()
+            _pipeline_logger.logger.info(
+                "Decision Engine: 使用 RuleDecisionClient（确定性规则）"
+            )
+
+        # FR-2.1: 关联告警缓存外置（Redis 可用 → 多实例共享；否则本地，行为不变）
+        from core.correlation_store import correlation_store_factory
+        self._correlation_store = correlation_store or correlation_store_factory(
+            extract_host_fn=_extract_host,
+        )
+        self._correlation_window_seconds = int(
+            os.getenv("AIOPS_CORRELATION_WINDOW_SECONDS", "300")
+        )
+        self._iterative_max_retries = int(
+            os.getenv("AIOPS_ITERATIVE_MAX_RETRIES", "1")
+        )
+        self._iterative_min_confidence = float(
+            os.getenv("AIOPS_ITERATIVE_MIN_CONFIDENCE", "0.5")
+        )
+        self._worker_pool = None
+        # FR-7: 运行时热配置提供者（PG 表 runtime_config + 5s 刷新）
+        self._runtime_config = runtime_config
+        # FR-1.1/1.2/1.3: 入口背压队列 / 风暴聚合器 / 降级控制器（run_from_source 装配）
+        self._ingest_queue = None
+        self._storm_aggregator = None
+        self._degradation = None
+        self.llm_breaker = None
+        self.message_producer = message_producer
+
+        # 独立 Agent 实例
+        llm_judge_enabled = os.getenv("AIOPS_LLM_JUDGE_ENABLED", "0") == "1"
+        self.diagnosis_agent = DiagnosisAgent(
+            llm_client=diagnosis_llm or llm,
+            kb=kb,
+            skill_registry=self.skill_registry,
+            jira_knowledge_retriever=jira_knowledge_retriever,
+            log_querier=log_querier,
+            metrics_querier=metrics_querier,
+        )
+        self.evaluation_agent = EvaluationAgent(
+            llm_client=evaluation_llm or llm,
+            min_confidence=float(os.getenv("AIOPS_MIN_CONFIDENCE", "0.7")),
+            llm_judge_enabled=llm_judge_enabled,
+            consistency_check_enabled=os.getenv("AIOPS_CONSISTENCY_CHECK_ENABLED", "1") == "1",
+        )
+        self.feedback_agent = FeedbackAgent(
+            ticketing=ticketing,
+            kb=kb,
+            llm_client=feedback_llm,
+        )
+
+        # ── FR-4: Pipeline 状态持久化（断点续跑）──
+        # 显式注入优先；未注入且 AIOPS_CHECKPOINT_ENABLED=1 时自动构建
+        # （PG 失败则降级禁用并记指标，不阻断启动；run_id 作为 checkpoint thread_id）
+        self._checkpointer = checkpointer
+        self.run_registry = run_registry
+        if self._checkpointer is None and os.getenv("AIOPS_CHECKPOINT_ENABLED", "0") == "1":
+            try:
+                from core.checkpointing import build_checkpointer
+                from core.pipeline_run_registry import PgPipelineRunRegistry
+                from core.config import pg_dsn
+                _dsn = pg_dsn()
+                self._checkpointer = build_checkpointer(_dsn)
+                self.run_registry = PgPipelineRunRegistry(_dsn)
+            except Exception as exc:
+                metrics.incr("pipeline.checkpoint.init_failed")
+                _pipeline_logger.logger.error(
+                    "checkpoint 初始化失败，降级为不持久化 | error={}", exc
+                )
+                self._checkpointer = None
+                self.run_registry = None
+        if self._checkpointer is not None and self.run_registry is None:
+            from core.pipeline_run_registry import InMemoryRunRegistry
+            self.run_registry = InMemoryRunRegistry()
+
+    def _find_correlated_alerts(self, alert: Alert) -> List[dict]:
+        """查找时间窗口内来自同一主机/服务的关联告警（FR-2.1: 委托 store）"""
+        return self._correlation_store.find_same_host(alert, self._correlation_window_seconds)
+
+    def _prune_recent_alerts(self):
+        """清理过期的关联告警缓存（FR-2.1: 委托 store）"""
+        self._correlation_store.prune(self._correlation_window_seconds)
+
+    def record_correlation(self, alert: Alert):
+        """FR-2.1: 记录告警到关联缓存（store 委托，多实例共享）"""
+        self._correlation_store.add(alert, self._correlation_window_seconds)
 
     def process_alert(
         self, alert: Alert, route_decision: Optional[AlertRouteDecision] = None
     ) -> str:
-        """处理进入的告警，返回可能产生的工单ID"""
-        started_at = time.perf_counter()
-        print(f"\n[Pipeline] === 开始处理新告警: {alert.alert_id} - {alert.title} ===")
+        """处理进入的告警，返回可能产生的工单ID。
+
+        使用 LangGraph 主图执行完整流水线。
+        """
         _pipeline_logger.alert_received(alert.alert_id, alert.title, alert.level)
-        pipeline_states.update(alert.alert_id, "received", level=alert.level)
-        metrics.incr("pipeline.alert.received")
-        route_decision = route_decision or self.router.decide(alert)
-        intent_decision = self.intent_classifier.classify(alert)
-        pipeline_states.update(
-            alert.alert_id,
-            "routed",
-            route=route_decision.route,
-            priority=route_decision.priority,
-            intent=intent_decision.category,
-        )
-        metrics.incr(f"pipeline.route.{route_decision.route}")
-        metrics.incr(f"pipeline.intent.{intent_decision.category}")
-        _pipeline_logger.audit_event(
-            "alert_routed",
-            {
-                "alert_id": alert.alert_id,
-                "route": route_decision.route,
-                "priority": route_decision.priority,
-                "reason": route_decision.reason,
-                "intent": intent_decision.category,
-                "intent_reason": intent_decision.reason,
-            },
-        )
-        print(
-            "[Pipeline] 意图识别: "
-            f"category={intent_decision.category} confidence={intent_decision.confidence} "
-            f"reason={intent_decision.reason}"
-        )
 
-        if route_decision.route == "manual_first":
-            ticket_id = self.ticketing.create_ticket(
-                alert,
-                self._build_manual_route_plan(route_decision.reason),
-                eval_reason=route_decision.reason,
-            )
-            _pipeline_logger.ticket_created(
-                alert.alert_id, ticket_id, route_decision.reason
-            )
-            pipeline_states.update(
-                alert.alert_id,
-                "ticket_created",
-                route=route_decision.route,
-                reason=route_decision.reason,
-            )
-            total_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-            metrics.observe("pipeline.alert.total.ms", total_duration_ms)
-            _pipeline_logger.performance_metric(
-                operation="process_alert",
-                duration_ms=total_duration_ms,
-                success=True,
-            )
-            print("[Pipeline] === 单次告警处理流转结束 ===\n")
-            return ticket_id
+        final_state = run_pipeline(alert=alert, pipeline=self)
 
-        # 1. 查找历史经验
-        pipeline_states.update(alert.alert_id, "knowledge_search")
-        with metrics.timer(
-            "pipeline.knowledge_search.ms",
-            success_counter="pipeline.knowledge_search.success",
-            failure_counter="pipeline.knowledge_search.failure",
-        ):
-            search_query = (
-                f"category={intent_decision.category} "
-                f"{alert.title} {alert.content}"
-            )
-            sops = self.kb.search_experience(search_query)
-            jira_cases = self._search_jira_cases(alert)
-            if jira_cases:
-                sops = list(sops) + jira_cases
-
-        # 1.1 调用可选 skills
-        pipeline_states.update(alert.alert_id, "skills_running")
-        skill_results = self.skill_registry.run(
-            alert,
-            {
-                "history_sops": sops,
-                "alert": alert.model_dump(),
-                "intent": {
-                    "category": intent_decision.category,
-                    "confidence": intent_decision.confidence,
-                    "reason": intent_decision.reason,
-                    "tags": intent_decision.tags,
-                },
-            },
-        )
-        if skill_results:
-            print(
-                "[Pipeline] 命中 Skills: "
-                + ", ".join(result.skill_name for result in skill_results)
-            )
-
-        # 2. 调用认知引擎分析
-        print("[Pipeline] 提交 LLM 引擎分析...")
-        _pipeline_logger.llm_analysis_start(alert.alert_id)
-        pipeline_states.update(alert.alert_id, "llm_analyzing")
-        with metrics.timer(
-            "pipeline.llm_analysis.ms",
-            success_counter="pipeline.llm_analysis.success",
-            failure_counter="pipeline.llm_analysis.failure",
-        ):
-            proposal = self.engine.analyze_alert(alert, sops, skill_results)
-        print(f"[Pipeline] LLM分析结案: 置信度 {proposal.plan.confidence_score}")
-        print(f"[Pipeline] 根因推测: {proposal.plan.root_cause_analysis}")
-        _pipeline_logger.llm_analysis_complete(
-            alert.alert_id, proposal.plan.confidence_score
-        )
-
-        # 3. 评估方案合法性有效性
-        print("[Pipeline] 提交内部安全评估器...")
-        pipeline_states.update(alert.alert_id, "evaluating")
-        with metrics.timer("pipeline.evaluation.ms"):
-            eval_result = self.evaluator.evaluate(alert, proposal)
-        _pipeline_logger.evaluation_result(
-            alert.alert_id,
-            eval_result.is_passed,
-            eval_result.reason,
-            eval_result.risk_level,
-        )
-
-        # 4. 路由与处置
-        ticket_id = None
-        if eval_result.is_passed:
-            print(f"[Pipeline] [PASS] 评估通过允许执行 ({eval_result.reason})")
-            if proposal.plan.script_content:
-                print("[Pipeline] [APPROVAL] 脚本执行前进入人工确认环节...")
-                pipeline_states.update(alert.alert_id, "awaiting_approval")
-                approved = self.approval_gate.confirm_execution(
-                    alert, proposal.plan, eval_result
-                )
-                if approved:
-                    print("[Pipeline] [EXEC] 人工确认通过，触发物理集群自动修复...")
-                    _pipeline_logger.execution_start(
-                        alert.alert_id, proposal.plan.script_content
-                    )
-                    _pipeline_logger.audit_event(
-                        "script_execution_approved",
-                        {
-                            "alert_id": alert.alert_id,
-                            "risk_level": eval_result.risk_level,
-                        },
-                    )
-                    pipeline_states.update(alert.alert_id, "executing")
-                    execution_success = False
-                    execution_failure_reason = ""
-                    try:
-                        with metrics.timer("pipeline.execution.ms"):
-                            execution_success = bool(
-                                self.executor.execute_script(
-                                    proposal.plan.script_content,
-                                    {"alert": alert.model_dump()},
-                                )
-                            )
-                    except Exception as exc:
-                        execution_failure_reason = f"脚本执行异常: {exc}"
-                    else:
-                        if not execution_success:
-                            execution_failure_reason = "脚本执行返回失败"
-
-                    if execution_success:
-                        metrics.incr("pipeline.execution.success")
-                        _pipeline_logger.execution_complete(alert.alert_id, True)
-                        pipeline_states.update(
-                            alert.alert_id, "resolved", route="auto_execute"
-                        )
-                    else:
-                        metrics.incr("pipeline.execution.failure")
-                        _pipeline_logger.execution_complete(alert.alert_id, False)
-                        _pipeline_logger.audit_event(
-                            "script_execution_failed",
-                            {
-                                "alert_id": alert.alert_id,
-                                "reason": execution_failure_reason,
-                                "risk_level": eval_result.risk_level,
-                            },
-                        )
-                        print(
-                            "[Pipeline] [FAIL] 自动修复执行失败 -> 提单至 Jira 人工辅助 "
-                            f"({execution_failure_reason})"
-                        )
-                        pipeline_states.update(
-                            alert.alert_id,
-                            "execution_failed",
-                            reason=execution_failure_reason,
-                        )
-                        ticket_id = self.ticketing.create_ticket(
-                            alert,
-                            proposal.plan,
-                            eval_reason=f"自动执行失败: {execution_failure_reason}",
-                        )
-                        _pipeline_logger.ticket_created(
-                            alert.alert_id, ticket_id, execution_failure_reason
-                        )
-                        pipeline_states.update(
-                            alert.alert_id,
-                            "ticket_created",
-                            route="auto_execute_failed",
-                            reason=execution_failure_reason,
-                        )
-                else:
-                    print("[Pipeline] [BLOCK] 人工确认拒绝执行 -> 提单至 Jira 人工辅助")
-                    _pipeline_logger.audit_event(
-                        "script_execution_rejected",
-                        {"alert_id": alert.alert_id, "reason": "approval_gate_rejected"},
-                    )
-                    ticket_id = self.ticketing.create_ticket(
-                        alert, proposal.plan, eval_reason="人工确认未通过"
-                    )
-                    _pipeline_logger.ticket_created(
-                        alert.alert_id, ticket_id, "人工确认未通过"
-                    )
-                    pipeline_states.update(
-                        alert.alert_id, "ticket_created", route="manual_rejected"
-                    )
-            else:
-                print(
-                    "[Pipeline] [WARN] 评估通过，但大模型未提供明确修复脚本，流程止步。"
-                )
-                pipeline_states.update(alert.alert_id, "passed_without_script")
-        else:
-            print(
-                f"[Pipeline] [BLOCK] 评估拦截危险/不确定 ({eval_result.reason}) -> 提单至 Jira 人工辅助"
-            )
-            _pipeline_logger.audit_event(
-                "proposal_blocked",
-                {
-                    "alert_id": alert.alert_id,
-                    "reason": eval_result.reason,
-                    "risk_level": eval_result.risk_level,
-                },
-            )
-            ticket_id = self.ticketing.create_ticket(
-                alert, proposal.plan, eval_reason=eval_result.reason
-            )
-            _pipeline_logger.ticket_created(
-                alert.alert_id, ticket_id, eval_result.reason
-            )
-            pipeline_states.update(alert.alert_id, "ticket_created", route="evaluator_block")
-
-        total_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-        metrics.observe("pipeline.alert.total.ms", total_duration_ms)
-        _pipeline_logger.performance_metric(
-            operation="process_alert",
-            duration_ms=total_duration_ms,
-            success=True,
-        )
-        print("[Pipeline] === 单次告警处理流转结束 ===\n")
+        ticket_id = final_state.get("ticket_id")
         return ticket_id or ""
 
     def run_from_source(self):
@@ -315,87 +211,114 @@ class AIOpsPipeline:
             raise RuntimeError("未配置 alert_source，无法启动持续消费模式")
 
         print("[Pipeline] === 启动持续消费模式 ===")
-        ticket_ids: List[str] = []
-        batch_size = max(1, int(getattr(self, "_batch_size", 0) or 0))
-        if batch_size <= 1:
-            batch_size = max(1, int(os.getenv("AIOPS_BATCH_SIZE", "1")))
-        batch_buffer: List[Alert] = []
+
+        from core.concurrent_pool import AlertWorkerPool
+        pool = AlertWorkerPool()
+        if pool.max_workers > 0:
+            pool.start()
+            self._worker_pool = pool
+        else:
+            print("[Pipeline] AIOPS_MAX_WORKERS=0，使用串行模式")
+            self._worker_pool = None
+
+        # FR-1.1: 入口背压 —— Ingest 线程 + 有界队列（队列满不拉取，offset 不动）
+        ingest_worker = None
+        if os.getenv("AIOPS_INGEST_BACKPRESSURE_ENABLED", "1") == "1":
+            from core.ingest import IngestQueue, IngestWorker
+            level_map = self.alert_cleaner.level_map if self.alert_cleaner else None
+            ingest_queue = IngestQueue(level_map=level_map)
+            self._ingest_queue = ingest_queue
+            ingest_worker = IngestWorker(self.alert_source, ingest_queue)
+            ingest_worker.start()
+            print(f"[Pipeline] [FR-1.1] 入口背压已启用 | queue_size={ingest_queue._maxsize}")
+
+        # FR-1.2: 风暴聚合器（AIOPS_AGG_ENABLED=0 关闭 → 每条自成一个 incident，等价现状）
+        if os.getenv("AIOPS_AGG_ENABLED", "1") == "1":
+            from core.storm_aggregator import StormAggregator
+            self._storm_aggregator = StormAggregator(
+                intent_classifier=self.intent_classifier,
+                extract_host_fn=_extract_host,
+            )
+            print(
+                f"[Pipeline] [FR-1.2] 风暴聚合已启用 | "
+                f"window={self._storm_aggregator.window_seconds}s"
+            )
+
+        # FR-1.3: 降级控制器（信号：kafka lag / 队列积压 / LLM 熔断器失败率）
+        if os.getenv("AIOPS_DEGRADE_ENABLED", "1") == "1":
+            from core.audit import AuditEmitter, get_audit_store
+            from core.degradation import DegradationController
+            self._degradation = DegradationController(
+                alert_source=self.alert_source,
+                queue=self._ingest_queue,
+                breaker=getattr(self, "llm_breaker", None),
+                emitter=AuditEmitter(store=get_audit_store()),
+                config_provider=self._runtime_config,
+            )
+            print("[Pipeline] [FR-1.3] 降级控制器已启用")
 
         try:
-            for raw_msg in self.alert_source.consume():
-                alert = self._clean_and_filter(raw_msg)
-                if alert is None:
-                    continue
-                batch_buffer.append(alert)
-                if len(batch_buffer) >= batch_size:
-                    ticket_ids.extend(self._process_alert_batch(batch_buffer))
-                    batch_buffer = []
+            while True:
+                # FR-1.3: 降级档评估（每轮采集信号，迟滞切换）
+                if self._degradation:
+                    self._degradation.refresh()
+
+                from core.consumption_graph import run_consumption
+                final_state = run_consumption(pipeline=self)
+
+                ticket_ids = final_state.get("ticket_ids", [])
+
+                if ticket_ids:
+                    self.feedback_agent.learn(ticket_ids)
+
+                    metrics.gauge("pipeline.feedback.pending_tickets", len(ticket_ids))
+
         except KeyboardInterrupt:
             print("\n[Pipeline] 收到中断信号，正在停止...")
         finally:
-            if batch_buffer:
-                ticket_ids.extend(self._process_alert_batch(batch_buffer))
-            self.alert_source.close()
-            if ticket_ids:
-                self.sync_feedbacks(ticket_ids)
-            metrics.gauge("pipeline.feedback.pending_tickets", len(ticket_ids))
+            if ingest_worker:
+                ingest_worker.stop()
+            self._ingest_queue = None
+            if self._worker_pool:
+                self._worker_pool.shutdown()
+                self._worker_pool = None
+            if self.alert_source:
+                self.alert_source.close()
+            self._report_diagnosis_accuracy()
             print("[Pipeline] === 持续消费模式已停止 ===\n")
 
-    def _clean_and_filter(self, raw_msg: dict) -> Optional[Alert]:
-        """对原始消息执行清洗和过滤，返回 None 表示丢弃"""
-        if self.alert_cleaner:
-            alert = self.alert_cleaner.clean(raw_msg)
-            if alert is None:
-                print("[Pipeline] [CLEAN] 告警清洗后丢弃")
-                return None
-        else:
-            try:
-                alert = Alert(**raw_msg)
-            except Exception as exc:
-                print(
-                    f"[Pipeline] [CLEAN] 无 cleaner 且原始消息无法直接转为 Alert: {exc}"
-                )
-                return None
-
-        if self.alert_filter and not self.alert_filter.should_process(alert):
-            print(f"[Pipeline] [FILTER] 告警被过滤 | alert_id={alert.alert_id}")
-            return None
-
-        return alert
-
     def sync_feedbacks(self, ticket_ids: List[str]):
-        """异步拉取已完结状态，打通学习闭环"""
-        print("\n[FeedbackSync] === 启动完结工单同步与知识回流 ===")
-        for tid in ticket_ids:
-            feedback = self.ticketing.get_resolution(tid)
-            if feedback and feedback.is_successful:
-                print(f"[FeedbackSync] 成功猎取票据 {tid} 的最终人工处理手段")
-                self.kb.learn_new_experience(feedback)
-                metrics.incr("pipeline.feedback.learned")
-                _pipeline_logger.feedback_received(
-                    feedback.alert_id, tid, feedback.is_successful
-                )
-                _pipeline_logger.knowledge_learned(
-                    feedback.alert_id, feedback.resolution_steps
-                )
-        print("[FeedbackSync] === 同步完毕 ===\n")
+        """同步工单反馈到知识库（使用 FeedbackAgent）"""
+        if not ticket_ids:
+            return
 
-    def _process_alert_batch(self, alerts: List[Alert]) -> List[str]:
-        metrics.incr("pipeline.batch.received")
-        metrics.gauge("pipeline.batch.size", len(alerts))
-        routed = [(alert, self.router.decide(alert)) for alert in alerts]
-        ordered = sort_alerts_by_priority(routed)
-        ticket_ids: List[str] = []
-        print(f"[Pipeline] [BATCH] 批量处理 {len(alerts)} 条告警，已按优先级排序")
-        for alert, route_decision in ordered:
-            print(
-                "[Pipeline] [BATCH] "
-                f"alert_id={alert.alert_id} route={route_decision.route} priority={route_decision.priority}"
-            )
-            tid = self.process_alert(alert, route_decision=route_decision)
-            if tid:
-                ticket_ids.append(tid)
-        return ticket_ids
+        result = self.feedback_agent.learn(ticket_ids)
+
+        learned_count = result.get("learned_count", 0)
+        print(f"[Pipeline] 反馈同步完成，学习 {learned_count} 条工单")
+
+    def _report_diagnosis_accuracy(self):
+        """输出诊断正确率报告"""
+        snap = metrics.snapshot()
+        counters = snap.get("counters", {})
+        correct = counters.get("pipeline.diagnosis.correct", 0)
+        incorrect = counters.get("pipeline.diagnosis.incorrect", 0)
+        blocked = counters.get("pipeline.diagnosis.blocked", 0)
+        passed = counters.get("pipeline.diagnosis.passed", 0)
+
+        total = correct + incorrect + blocked
+        if total == 0:
+            return
+
+        print("\n[Accuracy] === 诊断正确率报告 ===")
+        print(f"  评估通过: {passed}")
+        print(f"  执行成功: {correct}")
+        print(f"  执行失败: {incorrect}")
+        print(f"  评估拦截: {blocked}")
+        if correct + incorrect > 0:
+            exec_accuracy = correct / (correct + incorrect) * 100
+            print(f"  执行正确率: {exec_accuracy:.1f}%")
+        print(f"[Accuracy] ========================\n")
 
     def _search_jira_cases(self, alert: Alert) -> List[str]:
         if self.jira_knowledge_retriever is None:

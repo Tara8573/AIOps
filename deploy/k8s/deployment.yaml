@@ -1,0 +1,122 @@
+# FR-2.4：无状态多副本部署清单
+# 前置：FR-2.1（Redis 状态外置）+ FR-2.3（审计链持久化）已完成
+# 水平扩展：Kafka consumer group 分区消费；HPA 按 Kafka lag（KEDA）
+# 注意：topic 分区数 ≥ maxReplicaCount（见 keda-scaledobject.yaml）
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aiops
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiops-config
+  namespace: aiops
+data:
+  # 启动期参数（连接串走 Secret；运行时热参数走 runtime_config 表，FR-7）
+  AIOPS__RUNTIME__MODE: "kafka"
+  AIOPS__KB__USE_PG: "true"
+  AIOPS__AUDIT__STORE: "pg"
+  AIOPS_CHECKPOINT_ENABLED: "1"        # FR-4 断点续跑
+  AIOPS_APPROVAL_MODE: "async"         # FR-3 审批异步化（依赖 checkpoint）
+  AIOPS_APPROVAL_TIMEOUT: "3600"
+  AIOPS_METRICS_ENABLED: "1"           # FR-6 /metrics
+  AIOPS_METRICS_PORT: "9090"
+  AIOPS_INGEST_QUEUE_SIZE: "500"       # FR-1.1 背压
+  AIOPS_AGG_WINDOW_SECONDS: "30"       # FR-1.2 聚合
+  AIOPS_AGG_MAX_GROUP: "200"
+  AIOPS_DEGRADE_ENABLED: "1"           # FR-1.3 降级
+  AIOPS_LLM_GLOBAL_CONCURRENT: "10"    # FR-2.2 全局 LLM 配额
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-worker
+  namespace: aiops
+  labels:
+    app: aiops-worker
+spec:
+  replicas: 3
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0        # 滚动更新不丢消费能力
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: aiops-worker
+  template:
+    metadata:
+      labels:
+        app: aiops-worker
+    spec:
+      affinity:
+        podAntiAffinity:       # 散落节点（规格 FR-2.4）
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: aiops-worker
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 60   # 给消费循环优雅退出 + offset 提交时间
+      containers:
+        - name: aiops-worker
+          image: aiops:latest
+          command: ["python", "main.py"]
+          envFrom:
+            - configMapRef:
+                name: aiops-config
+          env:
+            - name: AIOPS__KB__PG__DSN
+              valueFrom:
+                secretKeyRef:
+                  name: aiops-secrets
+                  key: pg-dsn
+            - name: AIOPS_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: aiops-secrets
+                  key: redis-url
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:       # /healthz 由 FR-6 metrics 服务提供
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-worker
+  namespace: aiops
+  labels:
+    app: aiops-worker
+spec:
+  selector:
+    app: aiops-worker
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090

@@ -1,0 +1,299 @@
+# ============================================================
+# AIOps 统一配置文件
+# 环境变量覆盖约定: AIOPS__<SECTION>__<KEY>（双下划线分隔）
+# 例: AIOPS__LLM__API_KEY=sk-xxx 覆盖 llm.api_key
+# ============================================================
+
+runtime:
+  mode: demo                    # demo | kafka
+  log_level: INFO
+  log_json: false
+  log_dir: ./logs
+
+# ---- PG 连接（审计/审批/checkpoint/run registry/认证共用）----
+# 优先级：AIOPS__PG__DSN > AIOPS_PG_DSN（旧 env，兼容）> kb.pg.dsn（兼容回落）
+pg:
+  dsn: ""                       # 空 = 回落上述 env；compose 环境用 aiops_app 账号见 sql/rbac.sql
+
+# ---- LLM ----
+llm:
+  provider: openai              # openai | ollama
+  api_key: ""
+  base_url: https://api.openai.com/v1
+  model: ""
+  temperature: 0.2
+  timeout: 180
+  max_tokens: 2000
+  cache:
+    ttl_seconds: 300
+    max_size: 256
+    # ⚠ 键口径（有意权衡）：缓存键 = (title, level, content[:200], intent_category)，
+    # 不含 history_sops/skill_results —— 同告警内不同技能结果共享方案，换更高命中率；
+    # 如需按技能结果隔离，把 skill 摘要纳入 core/llm_engine.stable_cache_key 参数
+  max_concurrent: 4             # LLM 并发请求数上限
+  # ---- LLM 调用事件日志（LLMO-2，规格 docs/LLM调用可观测性与质量评估开发规格说明书.md）----
+  call_log:
+    enabled: true               # 总开关；=0 行为与现状完全一致
+    path: logs/llm_calls.jsonl  # append-only JSONL，一次调用 = 一行
+    capture_content: true       # 明文采集开关（LLMO-6.2）；写入前必经凭据脱敏
+    hash_chain: false           # hash chain 开关（调试期高频写入，按需开启）
+    max_memory: 100             # 内存环形摘要条数（不含明文）
+    rotate_bytes: 52428800      # 轮转阈值（50MB）
+
+# ---- 独立 Agent LLM ----
+# provider 为 default 时继承上方 llm 配置，否则独立配置
+agents:
+  diagnosis:
+    llm:
+      provider: default
+      api_key: ""
+      base_url: ""
+      model: ""
+      temperature: null         # null = 继承 llm.temperature
+      timeout: null
+      max_tokens: null
+  evaluation:
+    llm:
+      provider: default
+      api_key: ""
+      base_url: ""
+      model: ""
+      temperature: null
+      timeout: null
+      max_tokens: null
+  feedback:
+    llm:
+      provider: default
+      api_key: ""
+      base_url: ""
+      model: ""
+
+# ---- Knowledge Base ----
+kb:
+  use_pg: false
+  pg:
+    dsn: postgresql://postgres:postgres@127.0.0.1:5432/aiops
+    vector_dim: 1024
+    top_k: 3
+  search_cache:
+    ttl_seconds: 300
+    max_size: 256
+  dedup:
+    enabled: true
+    candidate_k: 5
+    distance_threshold: 0.08
+    overlap_threshold: 0.65
+    text_similarity_threshold: 0.72
+  support_count_weight: 0.05
+  db_role: service              # AIOPS_DB_ROLE：KB 连接会话角色（RLS aiops.role；空 = 不设置）
+  max_sop_items: 3
+  max_sop_chars: 300
+  negative_distance_threshold: 0.35   # AIOPS_KB_NEGATIVE_DISTANCE_THRESHOLD，负样本召回上限（超过不召回）
+  incident_distance_threshold: 0.35   # AIOPS_KB_INCIDENT_DISTANCE_THRESHOLD，事件案例召回上限
+
+# ---- Embedding ----
+embedding:
+  enabled: false
+  provider: local
+  api_url: ""
+  api_key: ""
+  api_key_header: Authorization
+  api_key_prefix: Bearer
+  model: ""
+  input_field: input
+  model_field: model
+  vector_path: data.0.embedding
+  timeout: 20
+  fallback_local: true
+
+# ---- Rerank ----
+rerank:
+  enabled: false
+  api_url: ""
+  api_key: ""
+  api_key_header: Authorization
+  api_key_prefix: Bearer
+  model: ""
+  query_field: query
+  docs_field: documents
+  model_field: model
+  scores_path: results
+  score_field: relevance_score
+  index_field: index
+  timeout: 20
+  candidate_k: 10
+  fallback_vector: true
+
+# ---- Jira Knowledge ----
+jira:
+  enabled: false
+  db: data/jira_knowledge.db
+  top_k: 5
+  base_url: https://your-domain.atlassian.net
+  email: your-email@example.com
+  username: ""
+  api_token: ""
+  project_keys: [OPS, SRE]
+  jql: ""
+  sync_days: 365
+  max_results: 100
+  timeout: 20
+
+# ---- Kafka ----
+kafka:
+  bootstrap_servers: localhost:9092
+  topic: aiops-alerts
+  group_id: aiops-consumer
+  auto_offset_reset: latest
+  poll_timeout_ms: 1000
+  max_poll_records: 100
+  field_map: {}                 # {target_field: source_path}
+  dedup_window: 300
+  min_level: Info
+  include_patterns: []
+  exclude_patterns: []
+  exclude_sources: []
+  title_exclude_patterns: []
+
+# ---- Routing / Evaluation ----
+routing:
+  min_confidence: 0.7
+  dangerous_script_patterns: []
+  batch_size: 1
+  manual_patterns: []
+  fast_track_patterns: []
+  correlation_window_seconds: 300
+  iterative_max_retries: 1
+  iterative_min_confidence: 0.5
+  domain_hint_confidence_threshold: 0.6
+  llm_judge_enabled: false
+  consistency_check_enabled: true
+
+# ---- Concurrency ----
+concurrency:
+  max_workers: 4
+
+# ---- Failure Handling ----
+failure:
+  pipeline_timeout_seconds: 0   # 0 = 不限制
+  pipeline_max_retries: 2
+  dlq_dir: data/dead_letters
+
+# ---- Pipeline 状态持久化 (FR-4) ----
+checkpoint:
+  enabled: false                 # AIOPS_CHECKPOINT_ENABLED=1 时启用 PostgresSaver 断点续跑
+  stale_threshold_seconds: 600   # 僵死 run 巡检阈值（resume_stale_runs）
+
+# ---- 异步审批 (FR-3) ----
+approval:
+  mode: sync                     # sync | async（AIOPS_APPROVAL_MODE）；async 需 checkpoint 启用
+  timeout_seconds: 3600          # AIOPS_APPROVAL_TIMEOUT，超时自动拒绝转工单
+  resume_interval_seconds: 2     # Resumer 轮询间隔
+  api_enabled: false             # 进程内启动审批回调 API（AIOPS_APPROVAL_API_ENABLED）
+  api_port: 9092                 # AIOPS_APPROVAL_API_PORT
+  api_auth: true                 # 回调 API 鉴权（ApiKeyAuthProvider，approval.decide 权限点）
+
+# ---- 入口背压 (FR-1.1) ----
+ingest:
+  backpressure_enabled: true     # AIOPS_INGEST_BACKPRESSURE_ENABLED
+  queue_size: 500                # AIOPS_INGEST_QUEUE_SIZE
+  storm_parking_size: 2000       # AIOPS_STORM_PARKING_SIZE
+
+# ---- 风暴聚合 (FR-1.2) ----
+aggregation:
+  enabled: true                  # AIOPS_AGG_ENABLED
+  window_seconds: 30             # AIOPS_AGG_WINDOW_SECONDS
+  max_group: 200                 # AIOPS_AGG_MAX_GROUP
+
+# ---- 自动降级 (FR-1.3) ----
+degradation:
+  enabled: true                       # AIOPS_DEGRADE_ENABLED
+  lag_threshold: 500                  # AIOPS_DEGRADE_LAG_THRESHOLD，超阈值触发 L1
+  lag_recover: 100                    # AIOPS_DEGRADE_LAG_RECOVER，低于此算恢复信号
+  timeout_rate: 0.3                   # AIOPS_DEGRADE_TIMEOUT_RATE，LLM 失败率触发 L1
+  timeout_rate_l2: 0.6                # AIOPS_DEGRADE_TIMEOUT_RATE_L2，触发 L2
+  l2_after_seconds: 120               # AIOPS_DEGRADE_L2_AFTER_SECONDS，L1 持续超时升 L2
+  forced_level: ""                    # 手动覆盖（FR-7 热开关）："" | L1 | L2
+
+# ---- 状态外置 (FR-2) ----
+redis:
+  url: ""                        # AIOPS_REDIS_URL（空 = 未启用，全部本地实现）
+  llm_global_concurrent: 10      # AIOPS_LLM_GLOBAL_CONCURRENT
+  llm_semaphore_wait: 10         # AIOPS_LLM_SEMAPHORE_WAIT（秒）
+  llm_semaphore_lease: 300       # AIOPS_LLM_SEMAPHORE_LEASE_SECONDS
+
+# ---- 可观测 (FR-6) ----
+metrics:
+  enabled: false                 # AIOPS_METRICS_ENABLED=1 启动 /metrics
+  port: 9090                     # AIOPS_METRICS_PORT
+
+# ---- 执行器 (FR-5/FR-8) ----
+executor:
+  mode: docker                   # docker | remote（AIOPS_EXECUTOR_MODE）
+  exec_timeout: 300              # AIOPS_EXEC_TIMEOUT，远程执行超时转工单
+
+# ---- 热配置 (FR-7) ----
+runtime_config:
+  enabled: true                  # AIOPS_RUNTIME_CONFIG_ENABLED
+  refresh_seconds: 5             # AIOPS_CONFIG_REFRESH_SECONDS
+
+# ---- Canary Execution ----
+canary:
+  enabled: false
+  ratio: 0.25
+  min_hosts: 1
+  max_hosts: 5
+  monitor_duration_seconds: 120
+  batch_size: 10
+  batch_interval_seconds: 30
+
+# ---- Security Audit ----
+audit:
+  enabled: true
+  store: file                   # file | pg（pg 需配置 AIOPS__PG__DSN；空/loguru 落地）| webhook
+  dir: ./logs/audit
+  pg_table: audit_events
+  webhook_url: ""
+  retention_days: 90
+  hash_chain_enabled: true
+
+# ---- Sandbox ----
+sandbox:
+  enabled: false
+  backend: docker               # docker | podman | firejail | restricted
+  image: aiops-sandbox:latest
+  cpu_limit: 1.0
+  memory_limit: 512m
+  pids_limit: 64
+  timeout_seconds: 300
+  disk_quota: 2g
+  network_policy: deny_all      # deny_all | whitelist | allow_all
+  network_allow: ""
+  user: nobody
+  cap_drop: ALL
+  cap_add: ""
+  readonly_rootfs: true
+  no_new_privileges: true
+  strict: true                  # 沙箱不可用时是否拒绝执行
+  seccomp_profile: default
+  apparmor_profile: docker-default
+
+# ---- Authentication & RBAC ----
+auth:
+  enabled: false
+  provider: api_key             # api_key | jwt | oauth
+  jwt_secret: ""
+  jwt_issuer: ""
+  session_ttl_seconds: 3600
+
+rbac:
+  enabled: false
+  kb_default_access_level: public   # public | internal | secret
+  service_account_name: aiops-pipeline
+
+# ---- LangSmith Tracing ----
+langsmith:
+  enabled: false
+  api_key: ""
+  project: aiops-pipeline
+  endpoint: https://api.smith.langchain.com

@@ -192,6 +192,7 @@ class TestEvalScorer:
             DimensionScore(name="step_quality", score=1.0, passed=True),
             DimensionScore(name="confidence_calibration", score=1.0, passed=True),
             DimensionScore(name="script_relevance", score=1.0, passed=True),
+            DimensionScore(name="consistency", score=1.0, passed=True),
         ]
         assert scorer.overall_score(dims) == 1.0
 
@@ -202,8 +203,9 @@ class TestEvalScorer:
             DimensionScore(name="step_quality", score=0.0, passed=False),
             DimensionScore(name="confidence_calibration", score=1.0, passed=True),
             DimensionScore(name="script_relevance", score=0.0, passed=False),
+            DimensionScore(name="consistency", score=0.5, passed=True),
         ]
-        # 0.35*1 + 0.25*0 + 0.15*1 + 0.25*0 = 0.50
+        # 0.30*1 + 0.20*0 + 0.10*1 + 0.20*0 + 0.20*0.5 = 0.50
         assert scorer.overall_score(dims) == 0.5
 
 

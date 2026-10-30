@@ -62,6 +62,13 @@ class CaseResult(BaseModel):
     generated_plan: Dict[str, Any] = Field(default_factory=dict)
     latency_ms: float = 0.0
     error: Optional[str] = None
+    # LLMO-4.2: 离线重放输入（raw 响应 + 渲染后 prompt 指纹），默认 None 向后兼容旧报告
+    raw_response: Optional[str] = Field(
+        None, description="LLM 原始响应（重放评测输入，LLMO-4.2）"
+    )
+    raw_prompt_hash: Optional[str] = Field(
+        None, description="渲染后 prompt 指纹（重放关联键，LLMO-4.2）"
+    )
 
 
 class DimensionStats(BaseModel):

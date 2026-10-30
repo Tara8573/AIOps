@@ -1,0 +1,24 @@
+# FR-2.4：KEDA ScaledObject —— 按 Kafka consumer lag 扩缩容
+# 前提：集群安装 KEDA（https://keda.sh）；topic 分区数 ≥ maxReplicaCount
+# 备选：不装 KEDA 时用 hpa-adapter.yaml（prometheus-adapter 自定义指标）
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: aiops-worker-scaler
+  namespace: aiops
+spec:
+  scaleTargetRef:
+    name: aiops-worker
+  minReplicaCount: 3
+  maxReplicaCount: 10
+  pollingInterval: 15
+  cooldownPeriod: 120
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka.kafka.svc:9092
+        consumerGroup: aiops-consumer
+        topic: aiops-alerts
+        lagThreshold: "500"      # 每副本允许的 lag；超阈值扩容
+        offsetResetPolicy: latest

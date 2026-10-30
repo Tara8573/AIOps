@@ -5,3 +5,21 @@ python-dotenv>=1.0.0
 httpx>=0.24.0
 loguru>=0.7.0
 kafka-python-ng>=2.2.2
+langgraph>=0.2.0
+langgraph-checkpoint-postgres>=2.0
+psycopg-pool>=3.2
+# ---- FR-3 审批回调 API ----
+fastapi>=0.110
+uvicorn>=0.29
+# ---- FR-2 状态外置 / 全局配额 ----
+redis>=5.0
+# ---- FR-6 可观测 ----
+prometheus-client>=0.20
+# ---- FR-8 凭据管理 ----
+hvac>=2.0
+langchain-core>=0.3.0
+langsmith>=0.1.0
+pyyaml>=6.0
+
+# ---- 测试依赖（tests/ 直接 import，修复：原未声明导致干净环境测试失败）----
+fakeredis>=2.20

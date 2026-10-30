@@ -291,6 +291,140 @@
         "max_confidence": 1.0
       },
       "tags": ["config", "security", "warning"]
+    },
+    {
+      "case_id": "disk-004",
+      "alert": {
+        "alert_id": "EVAL-DISK-004",
+        "title": "Tmpfs running out of space",
+        "level": "Warning",
+        "content": "Host app-03 /dev/shm usage at 95%, application failing to allocate shared memory segments"
+      },
+      "expected": {
+        "root_cause_keywords": ["shm", "tmpfs", "shared memory", "共享内存", "/dev/shm"],
+        "root_cause_category": "disk",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["df", "/dev/shm", "mount", "tmpfs", "ipcs"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.95
+      },
+      "tags": ["disk", "warning"]
+    },
+    {
+      "case_id": "memory-003",
+      "alert": {
+        "alert_id": "EVAL-MEM-003",
+        "title": "Java application GC pause time exceeding SLA",
+        "level": "Warning",
+        "content": "app-server-05 JVM full GC pause > 30s every 10 minutes, old gen usage 95%, heap size 8GB"
+      },
+      "expected": {
+        "root_cause_keywords": ["GC", "gc", "JVM", "jvm", "heap", "old gen", "内存", "memory"],
+        "root_cause_category": "memory",
+        "min_troubleshooting_steps": 3,
+        "step_keywords": ["jstat", "jmap", "gc", "heap dump", "jcmd", "-XX"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.9
+      },
+      "tags": ["memory", "warning", "java"]
+    },
+    {
+      "case_id": "network-003",
+      "alert": {
+        "alert_id": "EVAL-NET-003",
+        "title": "DNS resolution failures on k8s cluster",
+        "level": "Critical",
+        "content": "CoreDNS pods returning SERVFAIL for 30% of queries, affecting service discovery across all namespaces"
+      },
+      "expected": {
+        "root_cause_keywords": ["DNS", "dns", "CoreDNS", "coredns", "解析", "resolution", "SERVFAIL"],
+        "root_cause_category": "network",
+        "min_troubleshooting_steps": 3,
+        "step_keywords": ["kubectl", "coredns", "nslookup", "dig", "resolv.conf", "configmap"],
+        "expect_script": false,
+        "min_confidence": 0.4,
+        "max_confidence": 0.95
+      },
+      "tags": ["network", "critical", "kubernetes", "dns"]
+    },
+    {
+      "case_id": "service-004",
+      "alert": {
+        "alert_id": "EVAL-SVC-004",
+        "title": "Deployment rollout stuck",
+        "level": "Critical",
+        "content": "Deployment payment-service rollout progressing 0/3 replicas available for 20 minutes, new pods in ImagePullBackOff"
+      },
+      "expected": {
+        "root_cause_keywords": ["ImagePullBackOff", "image", "镜像", "pull", "deploy", "部署"],
+        "root_cause_category": "service",
+        "min_troubleshooting_steps": 3,
+        "step_keywords": ["kubectl", "describe", "events", "image", "registry", "docker"],
+        "expect_script": false,
+        "min_confidence": 0.5,
+        "max_confidence": 0.95
+      },
+      "tags": ["service", "critical", "kubernetes"]
+    },
+    {
+      "case_id": "database-003",
+      "alert": {
+        "alert_id": "EVAL-DB-003",
+        "title": "Redis memory usage critical",
+        "level": "Critical",
+        "content": "Redis instance cache-01 using 98% of maxmemory (7.8GB/8GB), eviction policy allkeys-lru, latency p99 > 50ms"
+      },
+      "expected": {
+        "root_cause_keywords": ["Redis", "redis", "内存", "memory", "maxmemory", "eviction", "缓存"],
+        "root_cause_category": "database",
+        "min_troubleshooting_steps": 3,
+        "step_keywords": ["INFO memory", "redis-cli", "maxmemory", "eviction", "bigkeys"],
+        "expect_script": false,
+        "min_confidence": 0.5,
+        "max_confidence": 0.95
+      },
+      "tags": ["database", "critical", "redis"]
+    },
+    {
+      "case_id": "cpu-002",
+      "alert": {
+        "alert_id": "EVAL-CPU-002",
+        "title": "Cron job consuming all CPU cores",
+        "level": "Warning",
+        "content": "Host batch-01 running a data export cron job since 2AM, all 16 CPU cores at 100%, other services degraded"
+      },
+      "expected": {
+        "root_cause_keywords": ["cron", "定时任务", "batch", "CPU", "cpu", "进程", "process"],
+        "root_cause_category": "cpu",
+        "min_troubleshooting_steps": 2,
+        "step_keywords": ["crontab", "ps", "top", "nice", "renice", "kill"],
+        "expect_script": false,
+        "min_confidence": 0.5,
+        "max_confidence": 0.95
+      },
+      "tags": ["cpu", "warning"]
+    },
+    {
+      "case_id": "security-002",
+      "alert": {
+        "alert_id": "EVAL-SEC-002",
+        "title": "Unauthorized API access spike",
+        "level": "Critical",
+        "content": "API gateway detecting 10x normal rate of 401/403 responses from IP range 198.51.100.0/24, targeting admin endpoints"
+      },
+      "expected": {
+        "root_cause_keywords": ["未授权", "unauthorized", "401", "403", "攻击", "attack", "API", "扫描"],
+        "root_cause_category": "security",
+        "min_troubleshooting_steps": 3,
+        "step_keywords": ["nginx", "access.log", "iptables", "fail2ban", "WAF", "封禁", "block"],
+        "expect_script": true,
+        "script_keywords": ["iptables", "block", "deny", "drop"],
+        "min_confidence": 0.5,
+        "max_confidence": 1.0
+      },
+      "tags": ["security", "critical"]
     }
   ]
 }

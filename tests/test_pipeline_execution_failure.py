@@ -29,8 +29,8 @@ class StaticLLM(ILLMClient):
     def generate_proposal(self, prompt: str) -> str:
         return json.dumps(
             {
-                "root_cause_analysis": "日志目录占用过高",
-                "troubleshooting_steps": ["检查磁盘占用", "清理过期日志"],
+                "root_cause_analysis": "/var 磁盘 disk 空间被日志占满导致 usage > 98%",
+                "troubleshooting_steps": ["df -h 检查 /var 磁盘 disk 占用", "清理 /var/log 过期日志"],
                 "script_content": "find /var/log -name '*.old' -delete",
                 "confidence_score": 0.95,
             },

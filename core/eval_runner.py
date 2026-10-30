@@ -2,7 +2,7 @@
 
 核心类：
 - PromptTemplateManager: 管理可替换的 prompt 模板
-- EvalScorer: 对 ActionPlan 进行四维度评分
+- EvalScorer: 对 ActionPlan 进行五维度评分
 - EvalRunner: 单轮评估运行器
 - PromptImprover: 基于失败用例改进 prompt 模板
 - EvalImproveLoop: 循环主控
@@ -10,6 +10,7 @@
 
 import json
 import random
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -25,9 +26,10 @@ from core.eval_models import (
     ExpectedOutcome,
     LoopResult,
     RunReport,
-    TagStats,
 )
+from core.llm_call_log import content_hash
 from core.llm_engine import parse_action_plan_json
+from core.llm_observed import llm_call_context
 from core.models import ActionPlan, Alert
 from interfaces.base import ILLMClient
 
@@ -37,6 +39,7 @@ from interfaces.base import ILLMClient
 # ---------------------------------------------------------------------------
 
 DEFAULT_TEMPLATE = """你是一个生产系统 AIOps 专家。请分析以下告警：
+
 【告警名称】: {alert_title}
 【告警级别】: {alert_level}
 【告警详情】: {alert_content}
@@ -45,11 +48,19 @@ DEFAULT_TEMPLATE = """你是一个生产系统 AIOps 专家。请分析以下告
 【可用 Skills 执行结果】:
 {skill_context}
 
+请按以下步骤进行分析：
+1. 先列出 2-4 个可能的根因假设，按可能性从高到低排列（possible_hypotheses）
+2. 逐个评估每个假设：根据告警内容中的具体指标、进程名、错误信息，说明支持或反对该假设的证据
+3. 综合以上分析得出最可能的根因，说明为什么排除了其他假设
+4. 给出具体的排查步骤，每步必须包含具体的命令或操作（如 df -h、kubectl describe pod 等）
+5. 如果有明确且安全的修复手段，提供可执行脚本；否则 script_content 设为 null
+
 请严格以 JSON 格式输出，包含以下字段：
-- root_cause_analysis (str): 根因推测
-- troubleshooting_steps (list[str]): 排查步骤
-- script_content (str | null): 如果有明确修复手段，提供可执行脚本代码，否则为 null
-- confidence_score (float): 你对该结论的置信度，0.0 到 1.0 的小数。
+- possible_hypotheses (list[object]): 可能的根因假设列表，每个包含 description(假设描述) 和 likelihood("high"/"medium"/"low")
+- root_cause_analysis (str): 综合所有假设后的最终根因推测，需引用告警中的具体信息作为依据
+- troubleshooting_steps (list[str]): 分步排查建议，每步要具体可执行，包含实际命令
+- script_content (str | null): 如果有明确且安全的修复手段，提供可执行脚本代码，否则为 null
+- confidence_score (float): 你对该结论的置信度，0.0 到 1.0 的小数。要诚实评估，不确定时不要虚高。
 """
 
 REQUIRED_PLACEHOLDERS = [
@@ -92,13 +103,14 @@ class PromptTemplateManager:
 
 
 class EvalScorer:
-    """评估 ActionPlan 质量的四维度打分器"""
+    """评估 ActionPlan 质量的五维度打分器"""
 
     WEIGHTS = {
-        "root_cause_relevance": 0.35,
-        "step_quality": 0.25,
-        "confidence_calibration": 0.15,
-        "script_relevance": 0.25,
+        "root_cause_relevance": 0.30,
+        "step_quality": 0.20,
+        "confidence_calibration": 0.10,
+        "script_relevance": 0.20,
+        "consistency": 0.20,
     }
 
     def __init__(self, pass_threshold: float = 0.6):
@@ -112,6 +124,7 @@ class EvalScorer:
             self._score_steps(plan, expected),
             self._score_confidence(plan, expected),
             self._score_script(plan, expected),
+            self._score_consistency(plan),
         ]
 
     def overall_score(self, dimensions: List[DimensionScore]) -> float:
@@ -133,12 +146,18 @@ class EvalScorer:
             )
         matched = sum(1 for kw in keywords if kw.lower() in text)
         ratio = matched / len(keywords)
-        score = min(ratio * 1.2, 1.0)  # 轻微放大，1 个命中即可及格
+        score = min(ratio * 1.2, 1.0)
+
+        if plan.possible_hypotheses:
+            hypothesis_bonus = min(len(plan.possible_hypotheses) * 0.05, 0.15)
+            score = min(score + hypothesis_bonus, 1.0)
+
         return DimensionScore(
             name="root_cause_relevance",
             score=round(score, 4),
             passed=score >= 0.3,
-            detail=f"命中 {matched}/{len(keywords)} 个关键词",
+            detail=f"命中 {matched}/{len(keywords)} 个关键词"
+            + (f", {len(plan.possible_hypotheses)} 条假设" if plan.possible_hypotheses else ""),
         )
 
     def _score_steps(
@@ -147,20 +166,17 @@ class EvalScorer:
         steps = plan.troubleshooting_steps
         min_steps = expected.min_troubleshooting_steps
 
-        # 步骤数达标
         count_ok = len(steps) >= min_steps if min_steps > 0 else True
         count_score = 1.0 if count_ok else len(steps) / max(min_steps, 1)
 
-        # 关键词命中
         step_text = " ".join(steps).lower()
         keywords = expected.step_keywords
         if keywords:
-            kw_hit = any(kw.lower() in step_text for kw in keywords)
-            kw_score = 1.0 if kw_hit else 0.0
+            matched_kw = sum(1 for kw in keywords if kw.lower() in step_text)
+            kw_score = min(matched_kw / max(len(keywords) * 0.5, 1), 1.0)
         else:
-            kw_score = 0.5  # 无期望关键词，给中性分
+            kw_score = 0.5
 
-        # 步骤具体性：平均长度 > 5 字符
         if steps:
             avg_len = mean(len(s) for s in steps)
             specificity = min(avg_len / 20.0, 1.0)
@@ -172,7 +188,7 @@ class EvalScorer:
             name="step_quality",
             score=round(score, 4),
             passed=score >= 0.4,
-            detail=f"步骤数 {len(steps)}/{min_steps}, 关键词命中={'是' if kw_score > 0.5 else '否'}",
+            detail=f"步骤数 {len(steps)}/{min_steps}, 关键词命中={kw_score > 0.5}",
         )
 
     def _score_confidence(
@@ -209,7 +225,7 @@ class EvalScorer:
                 matched = sum(1 for kw in keywords if kw.lower() in script_lower)
                 score = min(matched / len(keywords) * 1.5, 1.0)
             else:
-                score = 0.7  # 有脚本但无关键词要求
+                score = 0.7
             return DimensionScore(
                 name="script_relevance",
                 score=round(score, 4),
@@ -217,7 +233,6 @@ class EvalScorer:
                 detail=f"脚本关键词命中 {matched}/{len(keywords) if keywords else 0}",
             )
         else:
-            # 不期望脚本时，有脚本不扣分
             score = 1.0 if not plan.script_content else 0.8
             return DimensionScore(
                 name="script_relevance",
@@ -225,6 +240,45 @@ class EvalScorer:
                 passed=True,
                 detail="不期望脚本" + (", 已忽略" if plan.script_content else ""),
             )
+
+    def _score_consistency(self, plan: ActionPlan) -> DimensionScore:
+        """评估根因分析与排查步骤之间的逻辑一致性"""
+        rca = plan.root_cause_analysis.lower()
+        steps_text = " ".join(plan.troubleshooting_steps).lower()
+
+        if not rca or not steps_text:
+            return DimensionScore(
+                name="consistency",
+                score=0.3 if not steps_text else 0.5,
+                passed=not steps_text,
+                detail="缺少根因或步骤，无法评估一致性",
+            )
+
+        rca_keywords = [
+            w for w in re.findall(r"[a-zA-Z0-9_\-\./一-鿿]+", rca)
+            if len(w) > 2
+        ]
+
+        if not rca_keywords:
+            return DimensionScore(
+                name="consistency", score=0.5, passed=True, detail="根因无可提取关键词"
+            )
+
+        hit_count = sum(1 for kw in rca_keywords if kw in steps_text)
+        overlap_ratio = hit_count / len(rca_keywords)
+        score = min(overlap_ratio * 1.5, 1.0)
+
+        has_hypotheses = len(plan.possible_hypotheses) > 0
+        if has_hypotheses:
+            score = min(score + 0.1, 1.0)
+
+        return DimensionScore(
+            name="consistency",
+            score=round(score, 4),
+            passed=score >= 0.3,
+            detail=f"根因-步骤关键词重叠 {hit_count}/{len(rca_keywords)}"
+            + (f", 含 {len(plan.possible_hypotheses)} 条假设" if has_hypotheses else ""),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +321,10 @@ class EvalRunner:
     def _evaluate_single(self, case: EvalCase) -> CaseResult:
         alert = Alert(**case.alert)
         prompt = self.template_mgr.render(alert, [], "无可用 skill 输出")
+        # LLMO-4.2: 渲染后 prompt 指纹（重放关联键）
+        raw_prompt_hash = content_hash(prompt)
         start = time.perf_counter()
+        response_text: Optional[str] = None
         try:
             response_text = self.llm_client.generate_proposal(prompt)
             plan = parse_action_plan_json(response_text)
@@ -283,6 +340,8 @@ class EvalRunner:
                 passed=overall >= self.scorer.pass_threshold,
                 generated_plan=plan.model_dump(),
                 latency_ms=round(latency_ms, 2),
+                raw_response=response_text,
+                raw_prompt_hash=raw_prompt_hash,
             )
         except Exception as e:
             latency_ms = (time.perf_counter() - start) * 1000
@@ -295,6 +354,8 @@ class EvalRunner:
                 passed=False,
                 generated_plan={},
                 latency_ms=round(latency_ms, 2),
+                raw_response=response_text,
+                raw_prompt_hash=raw_prompt_hash,
                 error=str(e),
             )
 
@@ -391,7 +452,9 @@ class PromptImprover:
             failure_summary=failure_summary,
         )
 
-        response = self.llm_client.generate_proposal(prompt)
+        # LLMO-5.2: 调用上下文（stage=improve，role=eval_loop）
+        with llm_call_context(stage="improve", role="eval_loop"):
+            response = self.llm_client.generate_proposal(prompt)
         improved = self._extract_template(response)
 
         # 验证占位符完整性

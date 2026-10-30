@@ -1,9 +1,42 @@
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
 from loguru import logger
 from core.observability import metrics, pipeline_states
+
+# ── FR-8: 日志脱敏（凭据字段值 → ***）──
+_REDACT_PATTERNS = [
+    # api_key/token/password/secret 键值对
+    (re.compile(r'(api[_-]?key\"?\s*[:=]\s*\"?)([^\"\',\s}]+)', re.IGNORECASE), r'\1***'),
+    (re.compile(r'(?<![_-])token\"?\s*[:=]\s*\"?([^\"\',\s}]+)', re.IGNORECASE), r'token="***"'),
+    (re.compile(r'(password\"?\s*[:=]\s*\"?)([^\"\',\s}]+)', re.IGNORECASE), r'\1***'),
+    (re.compile(r'(secret\"?\s*[:=]\s*\"?)([^\"\',\s}]+)', re.IGNORECASE), r'\1***'),
+    # Authorization: Bearer xxx
+    (re.compile(r'(authorization\"?\s*[:=]\s*[\"\']?bearer\s+)([a-za-z0-9\-._~+/]+=*)', re.IGNORECASE), r'\1***'),
+    # DSN 内嵌密码 postgresql://user:pass@host
+    (re.compile(r'(postgres(?:ql)?://[^:/\s]+:)([^@\s]+)@', re.IGNORECASE), r'\1***@'),
+]
+
+
+def _redact_record(record):
+    """loguru patcher：对已格式化的 message 做凭据脱敏（FR-8）。"""
+    try:
+        msg = record["message"]
+        if msg:
+            for pattern, repl in _REDACT_PATTERNS:
+                msg = pattern.sub(repl, msg)
+            record["message"] = msg
+    except Exception:
+        pass
+
+
+def redact_text(text: str) -> str:
+    """对任意文本做凭据脱敏（供非 loguru 输出/审计使用）。"""
+    for pattern, repl in _REDACT_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
 
 
 class LogConfig:
@@ -53,6 +86,9 @@ class LogConfig:
         """
         # 移除默认处理器
         logger.remove()
+
+        # FR-8: 日志脱敏 patcher（所有输出统一脱敏，凭据不明文落盘）
+        logger.configure(patcher=_redact_record)
 
         # 选择格式
         log_format = LogConfig.JSON_FORMAT if json_format else LogConfig.DEFAULT_FORMAT
@@ -110,6 +146,17 @@ class AIOpsLogger:
     def __init__(self, module_name: str):
         self.logger = logger.bind(module=module_name)
         self.module_name = module_name
+
+    def __getattr__(self, name):
+        """未封装的 loguru 方法（info/warning/error/debug/success 等）透传给绑定 logger。
+
+        修复：kafka_source/kafka_producer 等直接以 logger.info(...) 调用导致的
+        AttributeError（AIOpsLogger 只封装了业务语义方法，缺通用日志级别方法）。
+        """
+        if name == "logger":
+            # 防 unpickling/初始化未完成时的无限递归
+            raise AttributeError(name)
+        return getattr(self.logger, name)
 
     def alert_received(self, alert_id: str, title: str, level: str):
         """告警接收日志"""

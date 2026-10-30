@@ -1,9 +1,12 @@
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 from statistics import mean
-from typing import Any, DefaultDict, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
+
+# 单指标保留的延迟样本上限（防长期运行内存无界增长）
+_MAX_LATENCY_SAMPLES = 1000
 
 
 class PipelineStateTracker:
@@ -28,7 +31,7 @@ class MetricsCollector:
 
     def __init__(self):
         self._counters: Counter[str] = Counter()
-        self._latencies: DefaultDict[str, List[float]] = defaultdict(list)
+        self._latencies: Dict[str, deque] = defaultdict(lambda: deque(maxlen=_MAX_LATENCY_SAMPLES))
         self._gauges: Dict[str, float] = {}
         self._lock = threading.Lock()
 

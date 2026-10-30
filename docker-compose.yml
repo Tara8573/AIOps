@@ -1,0 +1,174 @@
+services:
+  # ---- PostgreSQL + pgvector ----
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: aiops-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aiops
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init_pgvector.sql:/docker-entrypoint-initdb.d/01-init_pgvector.sql:ro
+      - ./sql/audit_events.sql:/docker-entrypoint-initdb.d/02-audit_events.sql:ro
+      - ./sql/rbac.sql:/docker-entrypoint-initdb.d/03-rbac.sql:ro
+      # 修复：补挂载缺失的建表脚本（原缺失 → approval_requests/pipeline_runs/
+      # runtime_config/audit_chain_state 表在 compose 环境不存在）
+      - ./sql/init_approval.sql:/docker-entrypoint-initdb.d/04-init_approval.sql:ro
+      - ./sql/audit_chain_state.sql:/docker-entrypoint-initdb.d/05-audit_chain_state.sql:ro
+      - ./sql/init_pipeline_runs.sql:/docker-entrypoint-initdb.d/06-init_pipeline_runs.sql:ro
+      - ./sql/init_runtime_config.sql:/docker-entrypoint-initdb.d/07-init_runtime_config.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aiops"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ---- AIOps 主应用 ----
+  aiops:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aiops-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      AIOPS__KB__USE_PG: "true"
+      AIOPS__KB__PG__DSN: postgresql://postgres:postgres@postgres:5432/aiops
+      # 修复：补统一 DSN（审计/审批/checkpoint/registry/认证共用，pg_dsn() 读取）
+      AIOPS__PG__DSN: postgresql://postgres:postgres@postgres:5432/aiops
+      AIOPS__AUDIT__STORE: pg
+      AIOPS__RUNTIME__LOG_DIR: /app/logs
+      AIOPS__RUNTIME__MODE: demo
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    profiles:
+      - demo
+
+  # ---- AIOps Kafka 模式 ----
+  aiops-kafka:
+    extends:
+      service: aiops
+    container_name: aiops-app-kafka
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      AIOPS__KB__USE_PG: "true"
+      AIOPS__KB__PG__DSN: postgresql://postgres:postgres@postgres:5432/aiops
+      # 修复：补统一 DSN（审计/审批/checkpoint/registry/认证共用，pg_dsn() 读取）
+      AIOPS__PG__DSN: postgresql://postgres:postgres@postgres:5432/aiops
+      AIOPS__AUDIT__STORE: pg
+      AIOPS__RUNTIME__LOG_DIR: /app/logs
+      AIOPS__RUNTIME__MODE: kafka
+      AIOPS__KAFKA__BOOTSTRAP_SERVERS: kafka:9092
+    profiles:
+      - kafka
+
+  # ---- AIOps worker（FR-2.1/2.4：可扩展多副本本地联调）----
+  # 用法: docker compose --profile scaled up --scale aiops-worker=2
+  # （无 container_name，可 --scale；状态外置 Redis + checkpoint 断点续跑）
+  aiops-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      AIOPS__KB__USE_PG: "true"
+      AIOPS__KB__PG__DSN: postgresql://postgres:postgres@postgres:5432/aiops
+      # 修复：补统一 DSN（审计/审批/checkpoint/registry/认证共用，pg_dsn() 读取）
+      AIOPS__PG__DSN: postgresql://postgres:postgres@postgres:5432/aiops
+      AIOPS__AUDIT__STORE: pg
+      AIOPS__RUNTIME__LOG_DIR: /app/logs
+      AIOPS__RUNTIME__MODE: kafka
+      AIOPS__KAFKA__BOOTSTRAP_SERVERS: kafka:9092
+      AIOPS_REDIS_URL: redis://redis:6379/0
+      AIOPS_CHECKPOINT_ENABLED: "1"      # FR-4 断点续跑
+      AIOPS_APPROVAL_MODE: async         # FR-3 审批异步化
+      AIOPS_METRICS_ENABLED: "1"         # FR-6 /metrics
+      AIOPS_METRICS_PORT: "9090"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    ports:
+      - "9090"                           # /metrics（多副本端口随机映射）
+    profiles:
+      - scaled
+
+  # ---- Zookeeper（Kafka 依赖）----
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: aiops-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    profiles:
+      - kafka
+
+  # ---- Redis（FR-2 状态外置：去重/关联/TTLC/分布式信号量）----
+  redis:
+    image: redis:7-alpine
+    container_name: aiops-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    profiles:
+      - kafka
+      - scaled
+
+  # ---- Kafka ----
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: aiops-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    profiles:
+      - kafka
+
+volumes:
+  pgdata:

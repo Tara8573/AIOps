@@ -1,5 +1,7 @@
 import os
 import json
+import threading
+
 import httpx
 from typing import Optional
 from core.observability import metrics
@@ -8,6 +10,9 @@ from interfaces.base import ILLMClient
 
 class OpenAILLMClient(ILLMClient):
     """OpenAI API 客户端实现"""
+
+    # LLMO-2.2: 观测层经 provider_name 识别 provider（只读能力，不改业务逻辑）
+    provider_name = "openai"
 
     def __init__(
         self,
@@ -26,6 +31,8 @@ class OpenAILLMClient(ILLMClient):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
+        # LLMO-2.2: 线程级最近调用 usage（并发池线程隔离，包装层同线程读取）
+        self._tls = threading.local()
 
         if not self.api_key:
             raise ValueError(
@@ -50,6 +57,8 @@ class OpenAILLMClient(ILLMClient):
 
     def generate_proposal(self, prompt: str) -> str:
         """调用 OpenAI Chat Completions API 生成提案"""
+        # LLMO-2.2: 线程级 usage 记录（不影响业务逻辑）
+        self._tls.last_usage = None
         try:
             metrics.incr("llm.provider.openai.request")
             response = self._client.post(
@@ -71,6 +80,8 @@ class OpenAILLMClient(ILLMClient):
             response.raise_for_status()
 
             result = response.json()
+            # LLMO-2.2: 保存原始 usage 供观测层读取（LLMO-2.2 disjoint 拆分在包装层完成）
+            self._tls.last_usage = result.get("usage")
             content = result["choices"][0]["message"]["content"]
             metrics.incr("llm.provider.openai.success")
             return content
@@ -87,6 +98,10 @@ class OpenAILLMClient(ILLMClient):
             metrics.incr("llm.provider.openai.exception")
             raise RuntimeError(f"OpenAI API 调用异常: {str(e)}")
 
+    def get_last_usage(self) -> Optional[dict]:
+        """LLMO-2.2: 返回最近一次调用（本线程）的原始 usage dict；无则 None。"""
+        return getattr(self._tls, "last_usage", None)
+
     def close(self):
         """关闭 HTTP 客户端"""
         self._client.close()
@@ -94,6 +109,9 @@ class OpenAILLMClient(ILLMClient):
 
 class OllamaLLMClient(ILLMClient):
     """Ollama 本地模型客户端实现"""
+
+    # LLMO-2.2: 观测层经 provider_name 识别 provider（只读能力，不改业务逻辑）
+    provider_name = "ollama"
 
     def __init__(
         self,
@@ -108,6 +126,8 @@ class OllamaLLMClient(ILLMClient):
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
+        # LLMO-2.2: 线程级最近调用 usage（并发池线程隔离，包装层同线程读取）
+        self._tls = threading.local()
 
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -122,6 +142,8 @@ class OllamaLLMClient(ILLMClient):
 
     def generate_proposal(self, prompt: str) -> str:
         """调用 Ollama API 生成提案"""
+        # LLMO-2.2: 线程级 usage 记录（prompt_eval_count/eval_count 映射，规格 P2）
+        self._tls.last_usage = None
         try:
             metrics.incr("llm.provider.ollama.request")
             response = self._client.post(
@@ -136,6 +158,11 @@ class OllamaLLMClient(ILLMClient):
             response.raise_for_status()
 
             result = response.json()
+            # LLMO-2.2: Ollama usage 映射（prompt_eval_count→input, eval_count→output，无缓存拆分）
+            self._tls.last_usage = {
+                "prompt_tokens": result.get("prompt_eval_count") or 0,
+                "completion_tokens": result.get("eval_count") or 0,
+            }
             metrics.incr("llm.provider.ollama.success")
             return result.get("response", "")
 
@@ -150,6 +177,10 @@ class OllamaLLMClient(ILLMClient):
         except Exception as e:
             metrics.incr("llm.provider.ollama.exception")
             raise RuntimeError(f"Ollama API 调用异常: {str(e)}")
+
+    def get_last_usage(self) -> Optional[dict]:
+        """LLMO-2.2: 返回最近一次调用（本线程）的 usage dict（Ollama 映射）；无则 None。"""
+        return getattr(self._tls, "last_usage", None)
 
     def close(self):
         """关闭 HTTP 客户端"""

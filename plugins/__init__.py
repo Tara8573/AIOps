@@ -18,6 +18,22 @@ try:
 except Exception:  # pragma: no cover
     KafkaAlertSource = None
 
+try:
+    from .rule_decision_client import RuleDecisionClient
+except Exception:  # pragma: no cover
+    RuleDecisionClient = None
+
+try:
+    from .jev_decision_client import (
+        JevDecisionClient,
+        JevDecisionClientStub,
+        create_jev_client,
+    )
+except Exception:  # pragma: no cover
+    JevDecisionClient = None
+    JevDecisionClientStub = None
+    create_jev_client = None
+
 __all__ = [
     "MockKnowledgeBase",
     "MockApprovalGate",
@@ -26,4 +42,8 @@ __all__ = [
     "MockLLMClient",
     "PostgresVectorKnowledgeBase",
     "KafkaAlertSource",
+    "RuleDecisionClient",
+    "JevDecisionClient",
+    "JevDecisionClientStub",
+    "create_jev_client",
 ]

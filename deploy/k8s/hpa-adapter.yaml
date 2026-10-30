@@ -1,0 +1,43 @@
+# FR-2.4（备选）：不装 KEDA 时，用 prometheus-adapter 自定义指标 HPA
+# 依赖：Prometheus + prometheus-adapter，暴露 aiops_kafka_consumer_lag 指标
+# （由 FR-6 的 /metrics 导出，ServiceMonitor 抓取）
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aiops-worker
+  namespace: aiops
+  labels:
+    app: aiops-worker
+spec:
+  selector:
+    matchLabels:
+      app: aiops-worker
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: aiops-worker-lag-hpa
+  namespace: aiops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: aiops-worker
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: aiops_kafka_consumer_lag
+        target:
+          type: AverageValue
+          averageValue: "500"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 缩容冷静期（防风暴后抖动）

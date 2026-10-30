@@ -1,10 +1,12 @@
 import re
 import hashlib
+import threading
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Set
 
 from core.models import Alert
 from core.logger import get_logger
+from core.observability import metrics
 from interfaces.base import IAlertCleaner, IAlertFilter
 
 logger = get_logger("processor")
@@ -31,11 +33,14 @@ class AlertCleaner(IAlertCleaner):
         level_map: Optional[Dict[str, str]] = None,
         default_source: str = "kafka",
         dedup_window: int = 300,
+        dedup_store: Optional["IDedupStore"] = None,
     ):
         self.field_map = field_map or {}
         self.level_map = level_map or self.DEFAULT_LEVEL_MAP
         self.default_source = default_source
-        self._seen: Dict[str, datetime] = {}
+        # FR-2.1: 去重存储外置（Redis 可用 → RedisDedupStore 多实例共享；否则本地实现）
+        from core.dedup_store import dedup_store_factory
+        self._dedup_store = dedup_store or dedup_store_factory()
         self._dedup_window = dedup_window
 
     def clean(self, raw: Dict[str, Any]) -> Optional[Alert]:
@@ -150,20 +155,9 @@ class AlertCleaner(IAlertCleaner):
         return datetime.now()
 
     def _is_duplicate(self, alert: Alert) -> bool:
-        now = datetime.now()
+        # FR-2.1: 去重逻辑委托 store（键口径不变：md5(title|content)）
         dedup_key = hashlib.md5(f"{alert.title}|{alert.content}".encode()).hexdigest()
-        last_seen = self._seen.get(dedup_key)
-        if last_seen and (now - last_seen).total_seconds() < self._dedup_window:
-            return True
-        self._seen[dedup_key] = now
-        expired = [
-            k
-            for k, v in self._seen.items()
-            if (now - v).total_seconds() > self._dedup_window * 2
-        ]
-        for k in expired:
-            del self._seen[k]
-        return False
+        return self._dedup_store.is_duplicate(dedup_key, self._dedup_window)
 
 
 class AlertFilter(IAlertFilter):
@@ -177,6 +171,7 @@ class AlertFilter(IAlertFilter):
         exclude_sources: Optional[List[str]] = None,
         exclude_alert_ids: Optional[Set[str]] = None,
         title_exclude_patterns: Optional[List[str]] = None,
+        config_provider: Optional[Any] = None,
     ):
         self.min_level = min_level
         self._level_order = {"Info": 0, "Warning": 1, "Critical": 2}
@@ -187,8 +182,43 @@ class AlertFilter(IAlertFilter):
         self.title_exclude_patterns = [
             re.compile(p) for p in (title_exclude_patterns or [])
         ]
+        # FR-7: 热参数（min_level/include/exclude patterns）—— config version 变化时重编译
+        self._provider = config_provider
+        self._config_version = -1
+
+    def _maybe_reload(self):
+        """FR-7: 热参数生效（version 变化 → 重编译 patterns/min_level）。
+
+        provider 缺失的键保持当前值（yaml 初始值不被清空）；无 provider 时零开销。
+        """
+        if self._provider is None:
+            return
+        try:
+            version = self._provider.version()
+        except Exception:
+            return
+        if version == self._config_version:
+            return
+        try:
+            min_level = self._provider.get("kafka.min_level")
+            if min_level:
+                self.min_level = str(min_level)
+            inc = self._provider.get("kafka.include_patterns")
+            if inc is not None:
+                raw = inc.split(",") if isinstance(inc, str) else list(inc)
+                self.include_patterns = [re.compile(p.strip()) for p in raw if p.strip()]
+            exc_pat = self._provider.get("kafka.exclude_patterns")
+            if exc_pat is not None:
+                raw = exc_pat.split(",") if isinstance(exc_pat, str) else list(exc_pat)
+                self.exclude_patterns = [re.compile(p.strip()) for p in raw if p.strip()]
+            self._config_version = version
+            metrics.incr("filter.hot_reloaded")
+        except Exception:
+            metrics.incr("filter.hot_reload_failed")
 
     def should_process(self, alert: Alert) -> bool:
+        self._maybe_reload()  # FR-7: 热参数检查（version 未变时零开销）
+
         if alert.alert_id in self.exclude_alert_ids:
             logger.logger.debug("过滤拦截: 黑名单 alert_id={}", alert.alert_id)
             return False
